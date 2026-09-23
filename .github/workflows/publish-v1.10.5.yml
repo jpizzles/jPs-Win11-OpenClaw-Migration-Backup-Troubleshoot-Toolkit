@@ -20,18 +20,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate v1.10.4 base package
+      - name: Rebuild and validate v1.10.4 base package from verified text chunks
         shell: bash
         run: |
           set -euo pipefail
-          BASE="dist/OpenClaw_Backup_Migration_Toolkit_v1.10.4.zip"
-          test -f "$BASE"
+          BASE="/tmp/OpenClaw_Backup_Migration_Toolkit_v1.10.4.zip"
+          cat .release/v1.10.4/tool.zip.b64.* | tr -d '\r\n' | base64 --decode > "$BASE"
+          echo "Base bytes: $(stat -c%s "$BASE")"
+          sha256sum "$BASE"
           unzip -t "$BASE"
           rm -rf /tmp/base-toolkit
           mkdir -p /tmp/base-toolkit
           unzip -q "$BASE" -d /tmp/base-toolkit
           SRC="/tmp/base-toolkit/OpenClaw_Backup_Migration_Toolkit"
           test -f "$SRC/OpenClaw-Backup-Migrate.ps1"
+          test -f "$SRC/OpenClaw-Backup-Migrate.cmd"
           grep -F '$Script:ToolVersion = "1.10.4"' "$SRC/OpenClaw-Backup-Migrate.ps1"
           grep -F 'Verifying native WSL OpenClaw immediately after install' "$SRC/OpenClaw-Backup-Migrate.ps1"
 
