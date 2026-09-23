@@ -234,4 +234,4 @@ OpenClaw is a separate project. This repository is an independent community util
 
 ## License
 
-No open-source license has been selected yet. Public availability does not by itself grant redistribution or modification rights. Add a license before accepting third-party redistribution or contributions.
+No open-source license has been selected yet. Public availability does not by itself grant redistribution or modification rights.
