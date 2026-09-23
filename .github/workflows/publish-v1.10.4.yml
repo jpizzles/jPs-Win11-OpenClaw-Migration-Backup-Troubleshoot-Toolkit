@@ -84,3 +84,5 @@ jobs:
         run: |
           set -euo pipefail
           gh release view v1.10.4 --json tagName,name,url,assets
+
+# Re-trigger after all verified payload chunks were staged.
