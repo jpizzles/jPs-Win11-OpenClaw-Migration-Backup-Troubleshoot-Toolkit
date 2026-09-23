@@ -1,4 +1,3 @@
 Hatch IQ OpenClaw Backup, Migration & Recovery Toolkit
-Latest: v1.10.6
-SHA-256: 55474b2f1f63573dfd19aff156ab4c80ba061c43a8413aa747311484a969af43
-Size: 50460 bytes
+Latest: v1.12.2
+SHA-256: be8c1999a1cd1777eca55b8cdbc2f7362f6246851eabdc479fa66eca7cb3f955

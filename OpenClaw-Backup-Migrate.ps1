@@ -32,7 +32,7 @@ Set-StrictMode -Version 2
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$Script:ToolVersion = "1.10.6"
+$Script:ToolVersion = "1.12.2"
 $Script:CurrentLog = $null
 
 $Script:SelectedDistro = $null
@@ -155,78 +155,125 @@ function Invoke-Native {
     return [pscustomobject]@{ ExitCode=$code; Output=(($output | ForEach-Object { $_.ToString() }) -join "`n") }
 }
 
-function Convert-TempWindowsPathToWsl([string]$WindowsPath) {
-    $full = [System.IO.Path]::GetFullPath($WindowsPath)
-    if ($full -match '^([A-Za-z]):\\(.*)$') {
-        $drive = $matches[1].ToLowerInvariant()
-        $rest = $matches[2] -replace '\\','/'
-        return "/mnt/$drive/$rest"
-    }
-    Fail "Temporary WSL script path is not on a local drive: $full"
-}
-
-function Invoke-WslScriptTransport {
+function Invoke-Wsl {
     param(
         [Parameter(Mandatory=$true)][string]$Command,
-        [switch]$AsRoot,
+        [string[]]$Arguments = @(),
         [switch]$AllowFailure,
-        [switch]$Quiet
+        [switch]$SensitiveOutput
     )
 
     if (-not $Script:SelectedDistro) { Select-WslDistro }
 
-    $tempRoot = Join-Path $env:TEMP "HatchIQ-OpenClaw-WslScripts"
-    Ensure-Directory $tempRoot
-    $scriptWin = Join-Path $tempRoot ("wsl-" + [guid]::NewGuid().ToString("N") + ".sh")
+    $cleanDistro = Normalize-WslDistroName $Script:SelectedDistro
+    if ([string]::IsNullOrWhiteSpace($cleanDistro)) {
+        throw "Selected WSL distro name is empty after normalization."
+    }
+    $Script:SelectedDistro = $cleanDistro
 
-    if ($AsRoot) {
-        $prelude = @'
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-'@
-    } else {
-        $prelude = @'
-export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-hash -r
-'@
+    # CRITICAL TRANSPORT RULE:
+    # Bash source is NEVER placed in the Windows command line. It is streamed
+    # through STDIN to `bash -s`. Optional positional arguments are passed
+    # separately after `--`, becoming Bash $1, $2, ... without shell quoting.
+    $linuxPathPrelude = 'export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; hash -r;'
+    $scriptText = $linuxPathPrelude + "`n" + $Command + "`n"
+
+    $wslExe = "$env:WINDIR\System32\wsl.exe"
+    if (-not (Test-Path -LiteralPath $wslExe -PathType Leaf)) {
+        $wslExe = "wsl.exe"
     }
 
-    $scriptText = "#!/usr/bin/env bash`n" + $prelude.TrimEnd() + "`n" + $Command.TrimEnd() + "`n"
-    $scriptText = $scriptText.Replace("`r`n","`n").Replace("`r","`n")
+    $argTokens = New-Object System.Collections.Generic.List[string]
+    $argTokens.Add("-d")
+    $argTokens.Add($cleanDistro)
+    $argTokens.Add("--exec")
+    $argTokens.Add("bash")
+    $argTokens.Add("-s")
+    $argTokens.Add("--")
 
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($scriptWin, $scriptText, $utf8NoBom)
-    $scriptWsl = Convert-TempWindowsPathToWsl $scriptWin
+    foreach ($a in @($Arguments)) {
+        if ($null -eq $a) { $argTokens.Add("") }
+        else { $argTokens.Add([string]$a) }
+    }
 
-    $args = @("-d", $Script:SelectedDistro)
-    if ($AsRoot) { $args += @("-u","root") }
-    $args += @("--","bash","--noprofile","--norc",$scriptWsl)
+    $quotedArgs = @($argTokens | ForEach-Object { Quote-WindowsArgument $_ })
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $wslExe
+    $psi.Arguments = ($quotedArgs -join " ")
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    # Windows PowerShell 5.1 uses .NET Framework ProcessStartInfo, which does
+    # NOT expose StandardInputEncoding. Bash source is written as raw
+    # UTF-8-no-BOM bytes to StandardInput.BaseStream instead.
+    if ($psi.PSObject.Properties.Name -contains "StandardOutputEncoding") {
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    }
+    if ($psi.PSObject.Properties.Name -contains "StandardErrorEncoding") {
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    }
+
+    $argCount = @($Arguments).Count
+    if ($SensitiveOutput) {
+        Info "wsl.exe -d $cleanDistro --exec bash -s -- [sensitive output suppressed; $argCount positional arg(s)]"
+    } else {
+        Info "wsl.exe -d $cleanDistro --exec bash -s -- [script via STDIN; $argCount positional arg(s)]"
+    }
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
 
     try {
-        if (-not $Quiet) {
-            Info ("WSL script transport: {0} ({1} chars)" -f $(if ($AsRoot) { "root" } else { "user" }), $Command.Length)
+        if (-not $proc.Start()) {
+            throw "wsl.exe failed to start."
         }
-        return Invoke-Native -FilePath "wsl.exe" -Arguments $args -AllowFailure:$AllowFailure -Quiet:$Quiet
+
+        # Read stdout/stderr asynchronously to prevent child-process pipe
+        # deadlocks during npm/OpenClaw installations and restore operations.
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+        $stdinBytes = $utf8NoBom.GetBytes($scriptText)
+        $proc.StandardInput.BaseStream.Write($stdinBytes, 0, $stdinBytes.Length)
+        $proc.StandardInput.BaseStream.Flush()
+        $proc.StandardInput.Close()
+
+        $proc.WaitForExit()
+
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+        $exitCode = $proc.ExitCode
+    } catch {
+        if (-not $AllowFailure) { throw }
+        $stdout = ""
+        $stderr = $_.Exception.Message
+        $exitCode = 1
     } finally {
-        try { Remove-Item -LiteralPath $scriptWin -Force -ErrorAction SilentlyContinue } catch {}
+        try { $proc.Dispose() } catch {}
     }
-}
 
-function Invoke-Wsl {
-    param(
-        [Parameter(Mandatory=$true)][string]$Command,
-        [switch]$AllowFailure,
-        [switch]$Quiet
-    )
-    return Invoke-WslScriptTransport -Command $Command -AllowFailure:$AllowFailure -Quiet:$Quiet
-}
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($stdout)) { $parts.Add($stdout.TrimEnd()) }
+    if (-not [string]::IsNullOrWhiteSpace($stderr)) { $parts.Add($stderr.TrimEnd()) }
+    $output = ($parts -join "`n")
 
-function Invoke-WslRoot {
-    param(
-        [Parameter(Mandatory=$true)][string]$Command,
-        [switch]$AllowFailure,
-        [switch]$Quiet
-    )
-    return Invoke-WslScriptTransport -Command $Command -AsRoot -AllowFailure:$AllowFailure -Quiet:$Quiet
+    if ($output -and (-not $SensitiveOutput)) {
+        $output -split "`r?`n" | ForEach-Object { Write-Host $_ }
+    }
+
+    if (($exitCode -ne 0) -and (-not $AllowFailure)) {
+        throw "WSL command failed with exit code $exitCode."
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = $output
+    }
 }
 
 function Convert-ToWslPath([string]$WindowsPath) {
@@ -258,6 +305,7 @@ function Convert-ToWslPath([string]$WindowsPath) {
     }
 
     if (-not $Script:SelectedDistro) { Select-WslDistro }
+    $Script:SelectedDistro = Normalize-WslDistroName $Script:SelectedDistro
     $output = & wsl.exe -d $Script:SelectedDistro -- wslpath -a -u $full 2>&1
     $code = $LASTEXITCODE
     if ($code -ne 0) {
@@ -350,6 +398,7 @@ function Copy-WslFileToWindowsRaw {
     )
 
     if (-not $Script:SelectedDistro) { Select-WslDistro }
+    $Script:SelectedDistro = Normalize-WslDistroName $Script:SelectedDistro
 
     $destFull = [System.IO.Path]::GetFullPath($WindowsDestination)
     $destDir = [System.IO.Path]::GetDirectoryName($destFull)
@@ -663,46 +712,36 @@ function Select-WslDistro {
 }
 
 function Test-OpenClawWsl {
-    # Prefer the canonical rootless Linux installation directly.
-    # Do NOT depend on `command -v openclaw` first because WSL can inherit a
-    # Windows npm shim via /mnt/c even when the native Linux CLI is healthy.
     $cmd = @'
 set -e
 
-if [ -x "$HOME/.openclaw/bin/openclaw" ]; then
-  resolved="$HOME/.openclaw/bin/openclaw"
-else
-  resolved="$(command -v openclaw 2>/dev/null || true)"
-fi
+OC="$HOME/.openclaw/bin/openclaw"
+NODE="$HOME/.openclaw/tools/node/bin/node"
 
-if [ -z "$resolved" ]; then
-  exit 127
-fi
+test -x "$OC"
+test -x "$NODE"
 
-printf 'OPENCLAW_WSL_PATH=%s\n' "$resolved"
+printf 'OPENCLAW_WSL_PATH=%s\n' "$OC"
+printf 'NODE_WSL_PATH=%s\n' "$NODE"
 
-# Reject Windows-mounted launchers without using the previous `case` syntax
-# that proved fragile through the Windows -> wsl.exe -> bash -lc transport.
-printf '%s\n' "$resolved" | grep -q '^/mnt/' && exit 126
-printf '%s\n' "$resolved" | grep -Eiq '\.(cmd|exe)$' && exit 126
-
-"$resolved" --version
+"$OC" --version
+"$NODE" --version
 '@
 
     $r = Invoke-Wsl $cmd -AllowFailure
-    if ($r.ExitCode -eq 0 -and $r.Output -match 'OPENCLAW_WSL_PATH=') {
-        $pathLine = ($r.Output -split "`r?`n" | Where-Object { $_ -like 'OPENCLAW_WSL_PATH=*' } | Select-Object -Last 1)
-        if ($pathLine) { Info $pathLine }
-        $versionLine = ($r.Output -split "`r?`n" | Where-Object { $_ -match '^OpenClaw ' } | Select-Object -Last 1)
+    if ($r.ExitCode -eq 0 -and
+        $r.Output -match '(?m)^OPENCLAW_WSL_PATH=/' -and
+        $r.Output -match '(?m)^NODE_WSL_PATH=/') {
+
+        $versionLine = ($r.Output -split "`r?`n" |
+            Where-Object { $_ -match '^OpenClaw ' } |
+            Select-Object -Last 1)
+
         Pass "OpenClaw is installed natively in WSL: $versionLine"
         return $true
     }
 
-    if ($r.ExitCode -eq 126) {
-        Warn "A Windows-mounted OpenClaw launcher was visible inside WSL and was rejected."
-    } else {
-        Warn "Native Linux OpenClaw is not installed in WSL."
-    }
+    Warn "Native Linux OpenClaw/private Node runtime is not installed or not executable in WSL."
     return $false
 }
 
@@ -742,7 +781,7 @@ fi
             -Problem "The WSL OpenClaw installer exceeded the 15-minute safety timeout." `
             -ManualSteps @(
                 "Open the selected WSL distro.",
-                'Run: export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+                "Run: export PATH=`"$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`"",
                 "Run: openclaw --version",
                 "If OpenClaw is already installed, exit WSL and run CONTINUE-RESTORE.cmd.",
                 "Otherwise run: curl -fsSL https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest",
@@ -784,10 +823,10 @@ printf 'NODE_FILE=%s\n' "$HOME/.openclaw/tools/node/bin/node"
         -Problem "Automatic OpenClaw installation inside WSL failed or could not be verified." `
         -ManualSteps @(
             "Open the selected WSL distro.",
-            'Run: export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+            "Run: export PATH=`"$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`"",
             "Run: curl -fsSL https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest",
-            'Verify: $HOME/.openclaw/bin/openclaw --version',
-            'Verify: $HOME/.openclaw/tools/node/bin/node --version',
+            "Verify: $HOME/.openclaw/bin/openclaw --version",
+            "Verify: $HOME/.openclaw/tools/node/bin/node --version",
             "Exit WSL and run CONTINUE-RESTORE.cmd."
         )
     Fail "OpenClaw WSL installation requires manual completion."
@@ -877,7 +916,8 @@ function Get-NewestArchive([string]$Folder) {
 }
 
 function Backup-WindowsNodeState([string]$PackageFolder) {
-    Step "Capturing Windows-side OpenClaw node state"
+    Step "Capturing Windows-side OpenClaw node identity and paired credential state"
+
     $winFolder = Join-Path $PackageFolder "Windows"
     Ensure-Directory $winFolder
 
@@ -898,33 +938,95 @@ function Backup-WindowsNodeState([string]$PackageFolder) {
         if ($xmlQuery.ExitCode -eq 0 -and $xmlQuery.Output) {
             Set-Content -LiteralPath (Join-Path $winFolder "OpenClaw-Node-task.xml") -Value $xmlQuery.Output -Encoding Unicode
             Pass "Exported Windows OpenClaw Node Scheduled Task."
-        } else {
-            Warn "Could not export Windows OpenClaw Node Scheduled Task XML."
         }
 
         if ($taskWasRunning) {
-            Info "Temporarily stopping Windows OpenClaw Node task to snapshot its files."
+            Info "Temporarily stopping Windows OpenClaw Node task to snapshot paired identity state."
             Invoke-Native -FilePath $schtasks -Arguments @("/End","/TN","\OpenClaw Node") -AllowFailure -Quiet | Out-Null
             Start-Sleep -Seconds 2
         }
     } else {
-        Warn "Windows OpenClaw Node Scheduled Task is not currently installed; backup will still capture available Windows state."
+        Warn "Windows OpenClaw Node task is not installed; available Windows state will still be captured."
+    }
+
+    # Save the public identity metadata separately so restore can verify that
+    # the same paired node identity survived migration. This output contains
+    # the device id/public identity, not the shared Gateway bearer token.
+    if (Test-Command "openclaw") {
+        $identity = Invoke-Native -FilePath "openclaw" -Arguments @("node","identity","--json") -AllowFailure -Quiet
+        if ($identity.ExitCode -eq 0 -and $identity.Output) {
+            Set-Content -LiteralPath (Join-Path $winFolder "node-identity.json") -Value $identity.Output -Encoding UTF8
+            Pass "Captured Windows node identity metadata."
+        } else {
+            Warn "Windows node identity metadata was not available."
+        }
     }
 
     $src = Join-Path $env:USERPROFILE ".openclaw"
     $zip = Join-Path $winFolder "windows-openclaw-state.zip"
-    if (Test-Path -LiteralPath $src) {
+
+    if (Test-Path -LiteralPath $src -PathType Container) {
         if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+
         try {
-            Compress-Archive -Path (Join-Path $src "*") -DestinationPath $zip -CompressionLevel Optimal -Force
-            if ((Get-Item $zip).Length -le 0) { Fail "Windows state ZIP is empty." }
-            Pass "Captured Windows .openclaw state: $zip"
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+            # ZipFile.CreateFromDirectory enumerates the real directory rather
+            # than using a PowerShell wildcard, so hidden/system state is not
+            # silently omitted. state\openclaw.sqlite carries nodeHost.config,
+            # signed device identity and durable paired device auth tokens.
+            [System.IO.Compression.ZipFile]::CreateFromDirectory(
+                $src,
+                $zip,
+                [System.IO.Compression.CompressionLevel]::Optimal,
+                $false
+            )
+
+            if ((Get-Item -LiteralPath $zip).Length -le 0) {
+                Fail "Windows state ZIP is empty."
+            }
+
+            $zr = [System.IO.Compression.ZipFile]::OpenRead($zip)
+            try {
+                $dbEntry = @($zr.Entries | Where-Object {
+                    $_.FullName.Replace('\','/') -ieq "state/openclaw.sqlite"
+                } | Select-Object -First 1)
+
+                if ($dbEntry) {
+                    Pass "Captured Windows paired-node SQLite state."
+                } else {
+                    Warn "Windows state ZIP does not contain state/openclaw.sqlite; automatic node-pairing migration may need bootstrap enrollment."
+                }
+            } finally {
+                $zr.Dispose()
+            }
+
+            Pass "Captured complete Windows .openclaw state: $zip"
         } catch {
-            Warn "Windows-side snapshot failed: $($_.Exception.Message)"
+            Warn "Windows-side state snapshot failed: $($_.Exception.Message)"
         }
     } else {
         Warn "Windows OpenClaw state folder does not exist: $src"
     }
+
+    @'
+WINDOWS NODE CREDENTIAL RECOVERY
+================================
+The main OpenClaw WSL archive already contains the Gateway state/config/credentials,
+including configured Gateway authentication secret state.
+
+This Windows snapshot is separate. Its state/openclaw.sqlite contains the Windows
+node's signed identity, nodeHost connection metadata, durable paired device token,
+and local exec-approval state.
+
+On a new PC, the Hatch IQ restore engine restores this paired node state first.
+That lets Windows CUA reconnect with its durable device credential without exposing,
+duplicating, or prompting for the shared Gateway bearer token.
+
+If the paired credential is unavailable or no longer valid, the restore engine uses a
+short-lived OpenClaw bootstrap/join credential to re-enroll the Windows node. The
+shared Gateway token is not written into an extra plaintext file.
+'@ | Set-Content -LiteralPath (Join-Path $winFolder "README-NODE-CREDENTIAL-RECOVERY.txt") -Encoding UTF8
 
     try {
         $proc = Get-CimInstance Win32_Process |
@@ -1091,6 +1193,50 @@ If an automatic prerequisite install cannot complete:
 A WSL/Windows-feature installation can legitimately require a Windows restart.
 The resume CMD is specifically there for that case.
 
+AFTER RESTORE: CONNECT WINDOWS HUB / OPENCLAW COMPANION
+--------------------------------------------------------
+If OpenClaw Companion says "No gateway yet" or "Disconnected":
+
+1. DO NOT click "Install" under "Get started: install a local gateway".
+   The restored Gateway already exists inside WSL.
+
+2. Click "Setup code" under "Or connect to an existing one".
+
+3. Open the restored WSL distro:
+     wsl.exe -d <restored-distro-name>
+
+4. Inside WSL run:
+     ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789
+
+5. Paste the resulting short-lived setup code into OpenClaw Companion.
+
+6. If approval is pending, inside WSL run:
+     ~/.openclaw/bin/openclaw devices list
+     ~/.openclaw/bin/openclaw devices approve <deviceRequestId>
+
+7. Windows node mode has a separate command-surface approval:
+     ~/.openclaw/bin/openclaw nodes pending
+     ~/.openclaw/bin/openclaw nodes approve <nodeRequestId>
+
+8. Verify:
+     ~/.openclaw/bin/openclaw nodes status
+     ~/.openclaw/bin/openclaw nodes describe --node "Windows CUA"
+
+Alternative Direct method:
+- URL: ws://127.0.0.1:18789
+- Token: run ~/.openclaw/bin/openclaw gateway auth-token --show interactively inside WSL.
+
+Prefer Setup code because it uses a short-lived bootstrap credential instead of requiring
+you to copy the shared Gateway bearer token.
+
+The restore also writes CONNECT-WINDOWS-HUB.txt into the external restore-log folder with
+the exact WSL distro name used on that PC.
+
+At the very end of a successful NEW-PC migration, if Windows Hub is installed, the toolkit
+also mints a fresh short-lived Setup code automatically and prints it prominently for
+copy/paste into OpenClaw Companion. The transcript is stopped before the code is minted, so
+the short-lived bootstrap credential is not written into tool-run.log.
+
 Keep this package private. It contains sensitive OpenClaw state and credentials.
 '@ | Set-Content -LiteralPath (Join-Path $PackageFolder "README-RESTORE.txt") -Encoding UTF8
 
@@ -1221,12 +1367,31 @@ OPENCLAW MIGRATION KIT
 4. The tool verifies SHA-256 checksums, ensures WSL/OpenClaw exist, restores the WSL archive into staging,
    activates the recorded state/workspace assets, runs Doctor, installs/rebuilds the Gateway service,
    and attempts to recreate the Windows CUA node service.
-5. Keep this folder private: it contains credentials and session history.
+5. After the migration reports COMPLETE, connect OpenClaw Windows Hub / Companion to the restored WSL Gateway:
+   - launch OpenClaw Companion;
+   - DO NOT choose "Install a local gateway";
+   - choose "Setup code" under "connect to an existing one";
+   - inside the restored WSL distro run:
+       ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789
+   - paste that short-lived setup code into the Companion;
+   - approve device/node requests from WSL if prompted:
+       ~/.openclaw/bin/openclaw devices list
+       ~/.openclaw/bin/openclaw devices approve <deviceRequestId>
+       ~/.openclaw/bin/openclaw nodes pending
+       ~/.openclaw/bin/openclaw nodes approve <nodeRequestId>
+   - verify Windows CUA:
+       ~/.openclaw/bin/openclaw nodes status
+       ~/.openclaw/bin/openclaw nodes describe --node "Windows CUA"
 
-The Windows\windows-openclaw-state.zip file is a recovery/reference snapshot of the source machine.
-The migration flow does NOT blindly overwrite the destination Windows .openclaw folder with it because
-that folder contains machine-specific identities, absolute paths, and tokens. Instead, the tool recreates
-the Windows CUA service safely on the new machine.
+6. The restore writes CONNECT-WINDOWS-HUB.txt into Documents\OpenClaw-Restore-Logs\<run> with the exact distro name.
+7. At the very end of a successful migration, the toolkit automatically prints a fresh short-lived Hub Setup code.
+   In OpenClaw Companion choose Connection -> Setup code, paste it, and connect.
+   The transcript is stopped before the code is generated, so the bootstrap credential is not persisted in tool-run.log.
+8. Keep this folder private: it contains credentials and session history.
+
+The Windows\windows-openclaw-state.zip file contains the source Windows node's paired identity/credential state.
+The current restore engine uses that snapshot to recover durable Windows CUA pairing when possible. If the old
+pairing is stale, complete the Setup code/device/node approval flow above to establish a fresh valid pairing.
 "@ | Set-Content -LiteralPath (Join-Path $package "README-MIGRATION.txt") -Encoding UTF8
         }
 
@@ -1467,6 +1632,21 @@ exit /b %EXITCODE%
     Write-Host "After fixing the prerequisite, run: $continue" -ForegroundColor Yellow
 }
 
+function Normalize-WslDistroName {
+    param([Parameter(Mandatory=$false)][string]$Name)
+
+    if ($null -eq $Name) { return "" }
+
+    # Remove NULs, BOM/zero-width format characters, and other Unicode control/
+    # format characters that can appear when wsl.exe UTF-16 output is captured
+    # by Windows PowerShell 5.1.
+    $n = [string]$Name
+    $n = $n -replace "`0", ""
+    $n = $n -replace "[\uFEFF\u200B\u200C\u200D\u2060]", ""
+    $n = [regex]::Replace($n, "\p{C}", "")
+    return $n.Trim()
+}
+
 function Get-WslDistroNames {
     $wslExe = "$env:WINDIR\System32\wsl.exe"
     if (-not (Test-Path -LiteralPath $wslExe)) { return @() }
@@ -1474,9 +1654,121 @@ function Get-WslDistroNames {
     $r = Invoke-Native -FilePath $wslExe -Arguments @("-l","-q") -AllowFailure -Quiet
     if ($r.ExitCode -ne 0) { return @() }
 
-    return @($r.Output -split "`r?`n" |
-        ForEach-Object { ($_ -replace "`0","").Trim() } |
-        Where-Object { $_ })
+    $seen = New-Object System.Collections.Generic.HashSet[string]([StringComparer]::OrdinalIgnoreCase)
+    $result = New-Object System.Collections.Generic.List[string]
+
+    foreach ($line in ($r.Output -split "`r?`n")) {
+        $name = Normalize-WslDistroName $line
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        if ($seen.Add($name)) { $result.Add($name) }
+    }
+
+    return @($result)
+}
+
+function Test-WslDistroLaunch {
+    param([Parameter(Mandatory=$true)][string]$DistroName)
+
+    $name = Normalize-WslDistroName $DistroName
+    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
+
+    $wslExe = "$env:WINDIR\System32\wsl.exe"
+
+    # Normal WSL distro names are ASCII without spaces. If a custom distro name
+    # contains whitespace, use the existing Windows argument quoting helper.
+    if ($name -match '^[A-Za-z0-9._-]+$') {
+        $nameArg = $name
+    } else {
+        $nameArg = Quote-WindowsArgument $name
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $wslExe
+    $psi.Arguments = "-d $nameArg --exec /bin/true"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    try {
+        if (-not $p.Start()) { return $false }
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit(15000)) {
+            try { $p.Kill() } catch {}
+            return $false
+        }
+        $null = $outTask.Result
+        $null = $errTask.Result
+        return ($p.ExitCode -eq 0)
+    } catch {
+        return $false
+    } finally {
+        try { $p.Dispose() } catch {}
+    }
+}
+
+function Resolve-WorkingWslDistro {
+    # First normalize/re-test the already selected distro.
+    $selected = Normalize-WslDistroName $Script:SelectedDistro
+    if ($selected) {
+        if ($selected -ne $Script:SelectedDistro) {
+            Warn "Normalized hidden/control characters out of WSL distro name."
+        }
+        $Script:SelectedDistro = $selected
+
+        if (Test-WslDistroLaunch $selected) {
+            Pass "WSL distro launch probe succeeded: $selected"
+            return $true
+        }
+
+        Warn "WSL lists '$selected', but a direct launch probe failed. Refreshing distro list."
+    }
+
+    $distros = @(Get-WslDistroNames)
+    if ($distros.Count -eq 0) { return $false }
+
+    # Prefer toolkit topology names, then test every listed distro.
+    $ordered = @()
+    foreach ($preferred in @("OpenClawGateway","Ubuntu-24.04")) {
+        if ($distros -contains $preferred) { $ordered += $preferred }
+    }
+    foreach ($d in $distros) {
+        if ($ordered -notcontains $d) { $ordered += $d }
+    }
+
+    foreach ($candidate in $ordered) {
+        $candidate = Normalize-WslDistroName $candidate
+        if (Test-WslDistroLaunch $candidate) {
+            $Script:SelectedDistro = $candidate
+            Pass "Selected launchable WSL distro: $candidate"
+            return $true
+        }
+        Warn "Ignoring listed but non-launchable WSL distro: $candidate"
+    }
+
+    return $false
+}
+
+function Get-AvailableOpenClawDistroName {
+    $distros = @(Get-WslDistroNames)
+
+    if ($distros -notcontains "OpenClawGateway") {
+        return "OpenClawGateway"
+    }
+
+    if (Test-WslDistroLaunch "OpenClawGateway") {
+        return "OpenClawGateway"
+    }
+
+    for ($i = 2; $i -le 50; $i++) {
+        $candidate = "OpenClawGateway-$i"
+        if ($distros -notcontains $candidate) { return $candidate }
+    }
+
+    Fail "Could not find a free WSL distro name for OpenClawGateway."
 }
 
 function Test-IsWindowsAdministrator {
@@ -1506,6 +1798,7 @@ function Wait-ForWslDistro {
         [int]$TimeoutSeconds = 90
     )
 
+    $DistroName = Normalize-WslDistroName $DistroName
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         if ((Get-WslDistroNames) -contains $DistroName) { return $true }
@@ -1707,11 +2000,11 @@ function Install-OpenClawGatewayDistroByImport {
     )
 
     $wslExe = "$env:WINDIR\System32\wsl.exe"
-    $distroName = "OpenClawGateway"
+    $distroName = Get-AvailableOpenClawDistroName
 
-    if ((Get-WslDistroNames) -contains $distroName) {
+    if ((Get-WslDistroNames) -contains $distroName -and (Test-WslDistroLaunch $distroName)) {
         $Script:SelectedDistro = $distroName
-        Pass "$distroName is already registered."
+        Pass "$distroName is already registered and launchable."
         return
     }
 
@@ -1809,8 +2102,9 @@ default=openclaw
 EOF
 '@
 
-    $Script:SelectedDistro = $DistroName
-    $r = Invoke-WslRoot -Command $initScript -AllowFailure
+    $r = Invoke-Native -FilePath $wslExe -Arguments @(
+        "-d",$DistroName,"-u","root","--","bash","-lc",$initScript
+    ) -AllowFailure
 
     if ($r.ExitCode -ne 0) {
         Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
@@ -1898,7 +2192,9 @@ else
 fi
 '@
 
-    $cfgResult = Invoke-WslRoot -Command $cfg -AllowFailure
+    $cfgResult = Invoke-Native -FilePath $wslExe -Arguments @(
+        "-d",$Script:SelectedDistro,"-u","root","--","bash","-lc",$cfg
+    ) -AllowFailure
 
     if ($cfgResult.ExitCode -ne 0) {
         Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
@@ -1950,10 +2246,15 @@ function Ensure-LinuxRestorePrerequisites {
     Warn "One or more Linux utilities are missing. Attempting automatic package installation."
     $wslExe = "$env:WINDIR\System32\wsl.exe"
 
-    $hasApt = Invoke-WslRoot -Command 'command -v apt-get >/dev/null 2>&1' -AllowFailure -Quiet
+    $hasApt = Invoke-Native -FilePath $wslExe -Arguments @(
+        "-d",$Script:SelectedDistro,"-u","root","--","bash","-lc","command -v apt-get >/dev/null 2>&1"
+    ) -AllowFailure -Quiet
 
     if ($hasApt.ExitCode -eq 0) {
-        $install = Invoke-WslRoot -Command 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 tar gzip coreutils dbus-x11 sudo passwd' -AllowFailure
+        $install = Invoke-Native -FilePath $wslExe -Arguments @(
+            "-d",$Script:SelectedDistro,"-u","root","--","bash","-lc",
+            "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 tar gzip coreutils dbus-x11 sudo passwd"
+        ) -AllowFailure
 
         if ($install.ExitCode -eq 0) {
             $linuxPrereqVerifyCmd = 'for c in bash curl python3 tar gzip sha256sum systemctl; do command -v "$c" >/dev/null 2>&1 || exit 1; done'
@@ -2026,53 +2327,62 @@ function Ensure-WslForRestore {
         Select-WslDistro
     }
 
-    if (-not $Script:SelectedDistro) {
-        Warn "No WSL Linux distribution is installed."
-        Info "Provisioning a dedicated Ubuntu 24.04 distro with wsl --import."
+    $workingDistro = Resolve-WorkingWslDistro
 
-        Install-OpenClawGatewayDistroByImport -SupportFolder $SupportFolder -PackageFolder $PackageFolder
-        Initialize-NewOpenClawWslDistro -DistroName $Script:SelectedDistro -SupportFolder $SupportFolder -PackageFolder $PackageFolder
+    if (-not $workingDistro) {
+        if ($NewPC) {
+            Warn "No listed WSL distro passed a real launch probe."
+            Info "Provisioning a fresh dedicated Ubuntu 24.04 OpenClawGateway distro with wsl --import."
+
+            $Script:SelectedDistro = $null
+            Install-OpenClawGatewayDistroByImport -SupportFolder $SupportFolder -PackageFolder $PackageFolder
+            Initialize-NewOpenClawWslDistro -DistroName $Script:SelectedDistro -SupportFolder $SupportFolder -PackageFolder $PackageFolder
+
+            if (-not (Resolve-WorkingWslDistro)) {
+                Fail "Freshly imported OpenClawGateway distro still cannot be launched."
+            }
+        } else {
+            Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
+                -Problem "WSL distributions are listed, but none can actually be launched." `
+                -ManualSteps @(
+                    "Run: wsl -l -v",
+                    "Try opening the intended distro once.",
+                    "Run CONTINUE-RESTORE.cmd."
+                )
+            Fail "No launchable WSL distro is available."
+        }
     }
 
     Pass "Using WSL distro: $($Script:SelectedDistro)"
 
-    # Confirm the distro actually starts.
-    $shellProbe = Invoke-Wsl "printf 'OPENCLAW_WSL_OK'; id -u; whoami" -AllowFailure
+    # Confirm the selected distro can execute the real STDIN transport too.
+    $shellProbe = Invoke-Wsl "printf 'OPENCLAW_WSL_OK
+'; id -u; whoami" -AllowFailure
     if ($shellProbe.ExitCode -ne 0 -or $shellProbe.Output -notmatch 'OPENCLAW_WSL_OK') {
-        Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
-            -Problem "The selected WSL distro exists but cannot start a normal shell." `
-            -ManualSteps @(
-                "Run: wsl -d $($Script:SelectedDistro)",
-                "Complete any first-run Linux setup if requested, then type exit.",
-                "Run CONTINUE-RESTORE.cmd."
-            )
-        Fail "WSL distro requires manual first-run setup."
+        if ($NewPC) {
+            Warn "The selected distro passed /bin/true but failed the Bash STDIN probe. Trying a fresh dedicated OpenClawGateway distro."
+
+            $Script:SelectedDistro = $null
+            Install-OpenClawGatewayDistroByImport -SupportFolder $SupportFolder -PackageFolder $PackageFolder
+            Initialize-NewOpenClawWslDistro -DistroName $Script:SelectedDistro -SupportFolder $SupportFolder -PackageFolder $PackageFolder
+
+            $shellProbe = Invoke-Wsl "printf 'OPENCLAW_WSL_OK
+'; id -u; whoami" -AllowFailure
+        }
+
+        if ($shellProbe.ExitCode -ne 0 -or $shellProbe.Output -notmatch 'OPENCLAW_WSL_OK') {
+            Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
+                -Problem "No WSL distro could pass the actual Bash STDIN execution probe." `
+                -ManualSteps @(
+                    "Run: wsl -l -v",
+                    "Run: wsl -d $($Script:SelectedDistro) --exec /bin/true",
+                    "Run CONTINUE-RESTORE.cmd."
+                )
+            Fail "WSL distro cannot execute the restore shell."
+        }
     }
 
-    Step "Checking WSL script transport integrity"
-    $transportProbe = @'
-set -e
-alpha="A"
-beta="$(printf 'B')"
-gamma='C D'
-printf 'WSL_SCRIPT_TRANSPORT_OK=%s:%s:%s\n' "$alpha" "$beta" "$gamma"
-[ "$alpha" = "A" ]
-[ "$beta" = "B" ]
-[ "$gamma" = "C D" ]
-'@
-    $transportResult = Invoke-Wsl $transportProbe -AllowFailure
-    if ($transportResult.ExitCode -ne 0 -or
-        $transportResult.Output -notmatch 'WSL_SCRIPT_TRANSPORT_OK=A:B:C D') {
-        Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
-            -Problem "The Windows-to-WSL script transport self-test failed. Restore was stopped before OpenClaw state activation." `
-            -ManualSteps @(
-                "Run: wsl -d $($Script:SelectedDistro) -- bash --noprofile --norc",
-                "At the Linux prompt run: printf 'WSL_OK\n'",
-                "Exit WSL and run CONTINUE-RESTORE.cmd."
-            )
-        Fail "WSL script transport integrity check failed."
-    }
-    Pass "WSL multiline variables/quoting/command substitution transport is intact."
+    Pass "WSL Bash STDIN execution probe succeeded."
 
     Ensure-WslSystemd -SupportFolder $SupportFolder -PackageFolder $PackageFolder
     Ensure-LinuxRestorePrerequisites -SupportFolder $SupportFolder -PackageFolder $PackageFolder
@@ -2084,13 +2394,13 @@ function Build-WslRestoreScript([string]$PackageFolder, [string]$ArchiveFile) {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Never allow WSL's inherited Windows PATH to select a Windows OpenClaw/npm
-# shim during restore. Use only the native Linux OpenClaw + private Node runtime.
 export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 hash -r
 
 ARCHIVE="${1:?archive path required}"
 LOG="${2:-$HOME/openclaw-migration-restore.log}"
+
+mkdir -p "$(dirname "$LOG")"
 exec > >(tee -a "$LOG") 2>&1
 
 say()  { printf '\n>>> %s\n' "$*"; }
@@ -2102,27 +2412,23 @@ trap 'warn "Restore failed at line $LINENO. Existing pre-restore backup/rollback
 
 say "Restore preflight"
 command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
 test -f "$ARCHIVE" || die "Archive not found: $ARCHIVE"
 
-resolved_openclaw="$HOME/.openclaw/bin/openclaw"
-resolved_node="$HOME/.openclaw/tools/node/bin/node"
+OC="$HOME/.openclaw/bin/openclaw"
 
-if [[ ! -x "$resolved_openclaw" || ! -x "$resolved_node" ]]; then
+if [[ ! -x "$OC" ]]; then
   say "Installing latest stable OpenClaw"
   curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest
-  hash -r
 fi
 
-[[ -x "$resolved_openclaw" ]] || die "Canonical Linux OpenClaw is still not available: $resolved_openclaw"
-[[ -x "$resolved_node" ]] || die "Canonical Linux Node runtime is still not available: $resolved_node"
-printf '[INFO] Native WSL OpenClaw: %s\n' "$resolved_openclaw"
-printf '[INFO] Native WSL Node: %s\n' "$resolved_node"
-"$resolved_openclaw" --version
-"$resolved_node" --version
-pass "Native WSL OpenClaw CLI and Node runtime available"
+[[ -x "$OC" ]] || die "Native Linux OpenClaw is still not available"
+printf '[INFO] Native WSL OpenClaw: %s\n' "$OC"
+"$OC" --version
+pass "Native WSL OpenClaw CLI available"
 
 say "Verifying archive before touching live state"
-openclaw backup verify "$ARCHIVE" --json
+"$OC" backup verify "$ARCHIVE" --json
 pass "Archive verified"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -2132,7 +2438,7 @@ ROLL="$HOME/OpenClaw-Rollback-$STAMP"
 mkdir -p "$PRER" "$ROLL"
 
 say "Stopping Gateway and creating a safety backup of destination state"
-openclaw gateway stop --force >/dev/null 2>&1 || true
+"$OC" gateway stop --force >/dev/null 2>&1 || true
 for i in $(seq 1 30); do
   state="$(systemctl --user is-active openclaw-gateway.service 2>/dev/null || true)"
   [[ "$state" != "active" && "$state" != "deactivating" ]] && break
@@ -2140,136 +2446,267 @@ for i in $(seq 1 30); do
 done
 
 if [[ -e "$HOME/.openclaw" ]]; then
-  openclaw backup create --output "$PRER" --verify --json || warn "Destination pre-restore OpenClaw backup could not be created; rollback folder will still be used."
+  "$OC" backup create --output "$PRER" --verify --json || warn "Destination pre-restore OpenClaw backup could not be created; rollback folder will still be used."
 fi
 
 say "Restoring OpenClaw archive to staging"
 rm -rf "$STAGE"
-openclaw backup restore "$ARCHIVE" --target "$STAGE"
+"$OC" backup restore "$ARCHIVE" --target "$STAGE"
 test -d "$STAGE" || die "Restore staging directory was not created"
 
 MANIFEST="$(find "$STAGE" -name manifest.json -type f -print -quit)"
 test -n "$MANIFEST" || die "manifest.json not found in staged restore"
 pass "Staged manifest: $MANIFEST"
 
-say "Planning and activating restored assets"
-python3 - "$MANIFEST" "$ROLL" <<'PY'
-import json, os, shutil, sys
+say "Planning, validating, and transactionally activating restored assets"
+python3 - "$MANIFEST" "$ROLL" "$STAGE" "$STAMP" <<'PY'
+import json
+import os
+import shutil
+import sys
 from pathlib import Path
 
 manifest_path = Path(sys.argv[1]).resolve()
 rollback = Path(sys.argv[2]).resolve()
-root = manifest_path.parent
+stage_root = Path(sys.argv[3]).resolve()
+stamp = sys.argv[4]
+manifest_dir = manifest_path.parent
 home = Path.home().resolve()
 
-m = json.loads(manifest_path.read_text())
+m = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
 assets = m.get("assets") or []
 if not assets:
     raise SystemExit("No assets[] found in manifest.")
 
-# Infer the old user's home from the state asset when possible.
+# Infer the old user's home from the state asset where possible.
 old_home = None
 for a in assets:
     if a.get("kind") == "state":
-        sp = str(a.get("sourcePath",""))
+        sp = str(a.get("sourcePath", ""))
         marker = "/.openclaw"
         if marker in sp:
-            old_home = Path(sp.split(marker,1)[0])
+            old_home = Path(sp.split(marker, 1)[0])
             break
 
 def map_dest(source):
     p = Path(source)
     if old_home:
         try:
-            rel = p.relative_to(old_home)
-            return home / rel
+            return home / p.relative_to(old_home)
         except Exception:
             pass
     return p
+
+def is_within(path, parent):
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except Exception:
+        return False
+
+def resolve_archive_path(archive):
+    ap = Path(str(archive))
+    candidates = []
+
+    if ap.is_absolute():
+        candidates.append(ap)
+    else:
+        # OpenClaw restore currently may keep archivePath prefixed by the backup
+        # directory name while placing manifest.json inside that same directory.
+        # STAGE/archivePath is therefore the primary candidate.
+        candidates.append(stage_root / ap)
+        candidates.append(manifest_dir / ap)
+        candidates.append(manifest_dir.parent / ap)
+
+        # If archivePath begins with the manifest directory's own name, strip
+        # that duplicated prefix and resolve from manifest_dir.
+        parts = ap.parts
+        if parts and parts[0] == manifest_dir.name and len(parts) > 1:
+            candidates.append(manifest_dir.joinpath(*parts[1:]))
+
+    seen = set()
+    checked = []
+    for c in candidates:
+        c = c.resolve(strict=False)
+        key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(c)
+
+        # Staged source material must remain inside the restore staging tree.
+        if not is_within(c, stage_root):
+            continue
+        if c.exists() or c.is_symlink():
+            return c
+
+    checked_text = "\n  ".join(str(x) for x in checked)
+    raise SystemExit(
+        f"Staged asset missing for archivePath={archive!r}. Checked:\n  {checked_text}"
+    )
 
 planned = []
 for a in assets:
     source = a.get("sourcePath")
     archive = a.get("archivePath")
-    kind = a.get("kind","unknown")
+    kind = a.get("kind", "unknown")
     if not source or not archive:
         continue
-    src = (root / archive).resolve()
-    dst = map_dest(source)
-    planned.append((len(str(dst)), kind, src, dst, source))
 
-# Parent assets first. Child assets covered by an already-restored parent are skipped.
-planned.sort()
-restored_roots = []
+    src = resolve_archive_path(archive)
+    dst = map_dest(source).resolve(strict=False)
+    planned.append({
+        "kind": kind,
+        "src": src,
+        "dst": dst,
+        "original": source,
+        "archive": archive,
+    })
 
-for _, kind, src, dst, original in planned:
-    covered = False
-    for parent in restored_roots:
+if not planned:
+    raise SystemExit("Manifest contained no restorable assets with sourcePath + archivePath.")
+
+# Parent destinations first, then remove child assets covered by a parent.
+planned.sort(key=lambda x: (len(str(x["dst"])), str(x["dst"])))
+top = []
+for item in planned:
+    if any(is_within(item["dst"], parent["dst"]) for parent in top):
+        print(f"[SKIP] {item['kind']}: {item['dst']} (covered by parent asset)")
+        continue
+    top.append(item)
+
+# Validate every source BEFORE touching destination state.
+for item in top:
+    src = item["src"]
+    if not src.exists() and not src.is_symlink():
+        raise SystemExit(f"Validated staged source disappeared before activation: {src}")
+    print(f"[VALID] {item['kind']}: {item['archive']} -> {src}")
+
+# Pre-copy every top-level asset to temporary destination-side paths.
+# No existing live destination is moved until ALL copies have succeeded.
+prepared = []
+try:
+    for idx, item in enumerate(top, 1):
+        src = item["src"]
+        dst = item["dst"]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        temp = dst.parent / f".{dst.name}.openclaw-restore-new-{stamp}-{idx}"
+        if temp.exists() or temp.is_symlink():
+            if temp.is_dir() and not temp.is_symlink():
+                shutil.rmtree(temp)
+            else:
+                temp.unlink()
+
+        print(f"[PREPARE] {item['kind']}: {src} -> {temp}")
+        if src.is_dir() and not src.is_symlink():
+            shutil.copytree(src, temp, symlinks=True, copy_function=shutil.copy2)
+        elif src.is_symlink():
+            os.symlink(os.readlink(src), temp)
+        else:
+            shutil.copy2(src, temp, follow_symlinks=False)
+
+        prepared.append((item, temp))
+except Exception:
+    for _, temp in prepared:
         try:
-            dst.relative_to(parent)
-            covered = True
-            break
+            if temp.is_dir() and not temp.is_symlink():
+                shutil.rmtree(temp)
+            elif temp.exists() or temp.is_symlink():
+                temp.unlink()
         except Exception:
             pass
-    if covered:
-        print(f"[SKIP] {kind}: {dst} (covered by parent asset)")
-        continue
+    raise
 
-    if not src.exists() and not src.is_symlink():
-        raise SystemExit(f"Staged asset missing: {src}")
+print(f"[PASS] Prepared {len(prepared)} top-level asset(s) without modifying live state.")
 
-    print(f"[PLAN] {kind}: {original} -> {dst}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
+# Swap prepared assets into place. If ANY swap fails, automatically restore
+# previously moved live destinations from rollback.
+activated = []
+try:
+    for item, temp in prepared:
+        dst = item["dst"]
+        original = item["original"]
+        kind = item["kind"]
 
-    if dst.exists() or dst.is_symlink():
-        rel = Path(str(dst).lstrip("/").replace(":","_"))
-        rb = rollback / rel
-        rb.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(dst), str(rb))
-        print(f"[ROLLBACK] moved existing {dst} -> {rb}")
+        rb = rollback / Path(str(dst).lstrip("/").replace(":", "_"))
+        had_old = dst.exists() or dst.is_symlink()
 
-    if src.is_dir() and not src.is_symlink():
-        shutil.copytree(src, dst, symlinks=True, copy_function=shutil.copy2)
-    elif src.is_symlink():
-        os.symlink(os.readlink(src), dst)
-    else:
-        shutil.copy2(src, dst, follow_symlinks=False)
+        print(f"[PLAN] {kind}: {original} -> {dst}")
 
-    restored_roots.append(dst)
+        if had_old:
+            rb.parent.mkdir(parents=True, exist_ok=True)
+            if rb.exists() or rb.is_symlink():
+                if rb.is_dir() and not rb.is_symlink():
+                    shutil.rmtree(rb)
+                else:
+                    rb.unlink()
+            shutil.move(str(dst), str(rb))
+            print(f"[ROLLBACK] moved existing {dst} -> {rb}")
 
-print(f"[PASS] Activated {len(restored_roots)} top-level restored asset(s).")
+        # Same-filesystem rename of the fully prepared replacement.
+        os.replace(str(temp), str(dst))
+        activated.append((dst, rb, had_old))
+        print(f"[ACTIVATE] {dst}")
+
+except Exception as exc:
+    print(f"[ERROR] Activation failed: {exc}", file=sys.stderr)
+    print("[ROLLBACK] Automatically restoring destinations already swapped.", file=sys.stderr)
+
+    for dst, rb, had_old in reversed(activated):
+        try:
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            elif dst.exists() or dst.is_symlink():
+                dst.unlink()
+
+            if had_old and (rb.exists() or rb.is_symlink()):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(rb), str(dst))
+                print(f"[ROLLBACK] restored {dst}", file=sys.stderr)
+        except Exception as rb_exc:
+            print(f"[ROLLBACK-WARN] Could not restore {dst}: {rb_exc}", file=sys.stderr)
+
+    # Clean any prepared-but-not-activated temp assets.
+    for _, temp in prepared:
+        try:
+            if temp.is_dir() and not temp.is_symlink():
+                shutil.rmtree(temp)
+            elif temp.exists() or temp.is_symlink():
+                temp.unlink()
+        except Exception:
+            pass
+
+    raise
+
+print(f"[PASS] Activated {len(activated)} top-level restored asset(s).")
 print(f"[INFO] Rollback material: {rollback}")
 PY
 
 say "Reinstalling/refreshing latest stable OpenClaw runtime after state activation"
-# A restored ~/.openclaw state asset may contain/replace tool paths, so refresh
-# the supported rootless runtime under ~/.openclaw and keep Windows PATH out.
 curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest
 export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 hash -r
-resolved_openclaw="$HOME/.openclaw/bin/openclaw"
-resolved_node="$HOME/.openclaw/tools/node/bin/node"
-[[ -x "$resolved_openclaw" ]] || die "Canonical Linux OpenClaw unavailable after runtime refresh"
-[[ -x "$resolved_node" ]] || die "Canonical Linux Node unavailable after runtime refresh"
-"$resolved_openclaw" --version
-"$resolved_node" --version
+OC="$HOME/.openclaw/bin/openclaw"
+[[ -x "$OC" ]] || die "Native Linux OpenClaw unavailable after runtime refresh"
+"$OC" --version
 
 say "Running database/config preflight and Doctor"
-openclaw database preflight || warn "Database preflight reported a problem; inspect before relying on this migration."
-openclaw doctor || die "OpenClaw Doctor failed after restore"
+"$OC" database preflight || warn "Database preflight is unavailable or reported a problem; continuing to Doctor."
+"$OC" doctor || die "OpenClaw Doctor failed after restore"
 
 say "Converging installed plugins"
-openclaw update repair || warn "Plugin/update repair reported warnings. Review 'openclaw update status' after migration."
+"$OC" update repair || warn "Plugin/update repair reported warnings. Review 'openclaw update status' after migration."
 
 say "Installing/reinstalling WSL Gateway service"
-openclaw gateway install || warn "Gateway service install returned non-zero; existing service may already be present."
-systemctl --user start openclaw-gateway.service || openclaw gateway start || true
+"$OC" gateway install || warn "Gateway service install returned non-zero; existing service may already be present."
+systemctl --user start openclaw-gateway.service || "$OC" gateway start || true
 sleep 8
 
 say "Final Gateway verification"
-if ! openclaw gateway status --deep; then
+if ! "$OC" gateway status --deep; then
   sleep 10
-  openclaw gateway status --deep || {
+  "$OC" gateway status --deep || {
     journalctl --user -u openclaw-gateway.service -n 100 --no-pager || true
     die "Gateway deep health probe failed after restore."
   }
@@ -2279,8 +2716,15 @@ pass "WSL migration restore completed."
 echo "STAGING=$STAGE"
 echo "ROLLBACK=$ROLL"
 echo "PRERESTORE_BACKUP=$PRER"
+
 '@
-    Set-Content -LiteralPath $restoreScript -Value $content -Encoding UTF8
+
+    # Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes a UTF-8 BOM.
+    # A BOM before #!/usr/bin/env breaks Linux shebang parsing. Always write the
+    # restore shell as UTF-8 WITHOUT BOM.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($restoreScript, $content, $utf8NoBom)
+
     return $restoreScript
 }
 
@@ -2321,7 +2765,9 @@ function Refresh-WindowsOpenClawPath {
         if ([string]::IsNullOrWhiteSpace($dir)) { continue }
         try {
             $full = [Environment]::ExpandEnvironmentVariables($dir.Trim())
-            if ([System.IO.Directory]::Exists($full) -and (-not $existing.Contains($full))) {
+            $isDir = $false
+            try { $isDir = Test-Path -LiteralPath $full -PathType Container -ErrorAction SilentlyContinue } catch {}
+            if ($isDir -and (-not $existing.Contains($full))) {
                 $env:PATH = "$full;$env:PATH"
                 [void]$existing.Add($full)
             }
@@ -2337,7 +2783,7 @@ function Find-WindowsOpenClawShim {
     )
 
     foreach ($candidate in $candidates) {
-        if ([System.IO.File]::Exists($candidate)) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             return $candidate
         }
     }
@@ -2494,10 +2940,278 @@ function Ensure-WindowsOpenClaw {
     Fail "Windows OpenClaw CLI requires manual installation/PATH repair."
 }
 
-function Rebuild-WindowsCuaNode {
-    Step "Rebuilding Windows CUA node service"
+function Get-JsonStringCandidates {
+    param([Parameter(Mandatory=$true)]$Object)
 
-    Ensure-WindowsOpenClaw -SupportFolder $Script:RestoreSupportFolder -PackageFolder $RestorePackage
+    $results = New-Object System.Collections.Generic.List[string]
+
+    function Walk-JsonValue($Value) {
+        if ($null -eq $Value) { return }
+
+        if ($Value -is [string]) {
+            $results.Add([string]$Value)
+            return
+        }
+
+        if ($Value -is [System.Collections.IDictionary]) {
+            foreach ($key in $Value.Keys) { Walk-JsonValue $Value[$key] }
+            return
+        }
+
+        if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+            foreach ($item in $Value) { Walk-JsonValue $item }
+            return
+        }
+
+        foreach ($prop in $Value.PSObject.Properties) {
+            Walk-JsonValue $prop.Value
+        }
+    }
+
+    Walk-JsonValue $Object
+    return @($results)
+}
+
+function Restore-WindowsNodePairingState {
+    param([Parameter(Mandatory=$true)][string]$PackageFolder)
+
+    if (-not $NewPC) { return $false }
+
+    $snapshot = Join-Path $PackageFolder "Windows\windows-openclaw-state.zip"
+    if (-not (Test-Path -LiteralPath $snapshot -PathType Leaf)) {
+        Warn "No Windows node-state snapshot is present in this package."
+        return $false
+    }
+
+    Step "Restoring Windows node paired identity from backup"
+
+    Invoke-Native -FilePath "openclaw" -Arguments @("node","stop") -AllowFailure -Quiet | Out-Null
+
+    # Keep the optional Hub from touching shared Windows OpenClaw state while
+    # its node identity database is being replaced.
+    try {
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessName -match '(?i)^OpenClaw(\.Tray\.WinUI|Tray)?$'
+        } | Stop-Process -Force -ErrorAction SilentlyContinue
+    } catch {}
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $extract = Join-Path $Script:RestoreSupportFolder ("WindowsNodeState-" + [guid]::NewGuid().ToString("N"))
+    Ensure-Directory $extract
+
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($snapshot, $extract)
+
+        $sourceDb = Join-Path $extract "state\openclaw.sqlite"
+        if (-not (Test-Path -LiteralPath $sourceDb -PathType Leaf)) {
+            Warn "The Windows snapshot does not contain state\openclaw.sqlite."
+            return $false
+        }
+
+        $destRoot = Join-Path $env:USERPROFILE ".openclaw"
+        $destState = Join-Path $destRoot "state"
+        Ensure-Directory $destState
+
+        # Preserve the newly-created destination state before replacing it.
+        $destDb = Join-Path $destState "openclaw.sqlite"
+        if (Test-Path -LiteralPath $destDb -PathType Leaf) {
+            $safetyDir = Join-Path $Script:RestoreSupportFolder "WindowsNodeState-BeforeRestore"
+            Ensure-Directory $safetyDir
+
+            foreach ($name in @("openclaw.sqlite","openclaw.sqlite-wal","openclaw.sqlite-shm")) {
+                $candidate = Join-Path $destState $name
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    Copy-Item -LiteralPath $candidate -Destination (Join-Path $safetyDir $name) -Force
+                }
+            }
+        }
+
+        foreach ($name in @("openclaw.sqlite","openclaw.sqlite-wal","openclaw.sqlite-shm")) {
+            Remove-Item -LiteralPath (Join-Path $destState $name) -Force -ErrorAction SilentlyContinue
+        }
+
+        foreach ($name in @("openclaw.sqlite","openclaw.sqlite-wal","openclaw.sqlite-shm")) {
+            $srcFile = Join-Path (Join-Path $extract "state") $name
+            if (Test-Path -LiteralPath $srcFile -PathType Leaf) {
+                Copy-Item -LiteralPath $srcFile -Destination (Join-Path $destState $name) -Force
+            }
+        }
+
+        # Include retired identity inputs if they exist. Doctor owns migration
+        # of these older layouts and will reconcile them into canonical SQLite.
+        $legacyIdentity = Join-Path $extract "identity"
+        if (Test-Path -LiteralPath $legacyIdentity -PathType Container) {
+            $destIdentity = Join-Path $destRoot "identity"
+            if (-not (Test-Path -LiteralPath $destIdentity)) {
+                Copy-Item -LiteralPath $legacyIdentity -Destination $destIdentity -Recurse -Force
+            }
+        }
+
+        foreach ($legacyName in @("node.json")) {
+            $legacy = Join-Path $extract $legacyName
+            if (Test-Path -LiteralPath $legacy -PathType Leaf) {
+                Copy-Item -LiteralPath $legacy -Destination (Join-Path $destRoot $legacyName) -Force
+            }
+        }
+
+        $doctor = Invoke-Native -FilePath "openclaw" -Arguments @("doctor","--fix") -AllowFailure -Quiet
+        if ($doctor.ExitCode -ne 0) {
+            Warn "Windows Doctor returned non-zero after restoring node state; continuing to identity verification."
+        }
+
+        $identity = Invoke-Native -FilePath "openclaw" -Arguments @("node","identity","--json") -AllowFailure -Quiet
+        if ($identity.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($identity.Output)) {
+            Warn "Restored Windows node identity could not be verified."
+            return $false
+        }
+
+        Set-Content -LiteralPath (Join-Path $Script:RestoreSupportFolder "restored-windows-node-identity.json") `
+            -Value $identity.Output -Encoding UTF8
+
+        # Compare the source identity metadata when the source backup included it.
+        $savedIdentityPath = Join-Path $PackageFolder "Windows\node-identity.json"
+        if (Test-Path -LiteralPath $savedIdentityPath -PathType Leaf) {
+            try {
+                $saved = Get-Content -LiteralPath $savedIdentityPath -Raw | ConvertFrom-Json
+                $restored = $identity.Output | ConvertFrom-Json
+
+                $savedStrings = @(Get-JsonStringCandidates $saved)
+                $restoredStrings = @(Get-JsonStringCandidates $restored)
+
+                $sharedIds = @($savedStrings | Where-Object {
+                    $_ -match '^[0-9a-fA-F]{32,128}$' -and $restoredStrings -contains $_
+                })
+
+                if ($sharedIds.Count -gt 0) {
+                    Pass "Restored Windows node cryptographic identity matches backup metadata."
+                } else {
+                    Warn "Windows node identity restored, but source identity metadata could not be matched exactly."
+                }
+            } catch {
+                Warn "Could not compare source/restored Windows node identity JSON."
+            }
+        }
+
+        Pass "Restored Windows node paired credential state from the backup."
+        return $true
+    } catch {
+        Warn "Windows node paired-state restore failed: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-WindowsCuaConnected {
+    $r = Invoke-Wsl '"$HOME/.openclaw/bin/openclaw" nodes list --connected --json' -AllowFailure
+    if ($r.ExitCode -ne 0) { return $false }
+    return ($r.Output -match '(?i)Windows CUA')
+}
+
+function Get-AutomaticNodeJoinTarget {
+    Step "Minting short-lived Windows node bootstrap credential"
+
+    # First try the node-specific join-code flow. Suppress output because it
+    # contains a single-use bootstrap credential.
+    $join = Invoke-Wsl `
+        -Command '"$HOME/.openclaw/bin/openclaw" devices join-code --json --url ws://127.0.0.1:18789' `
+        -AllowFailure -SensitiveOutput
+
+    if ($join.ExitCode -eq 0 -and $join.Output) {
+        try {
+            $obj = $join.Output | ConvertFrom-Json
+            foreach ($s in @(Get-JsonStringCandidates $obj)) {
+                if ($s -match '(https?://[^\s"]+/j/[A-Za-z0-9_-]+)') { return $Matches[1] }
+                if ($s -match '(oc-pair://[A-Za-z0-9._~:/?#\[\]@!$&''()*+,;=%-]+)') { return $Matches[1] }
+            }
+        } catch {}
+    }
+
+    # Fallback: create a direct setup code with an explicit same-host WSL
+    # Gateway endpoint. `openclaw connect` accepts the bare setup code.
+    $qr = Invoke-Wsl `
+        -Command '"$HOME/.openclaw/bin/openclaw" qr --setup-code-only --url ws://127.0.0.1:18789' `
+        -AllowFailure -SensitiveOutput
+
+    if ($qr.ExitCode -eq 0 -and $qr.Output) {
+        $candidate = @($qr.Output -split "`r?`n" |
+            ForEach-Object { $_.Trim() } |
+            Where-Object {
+                $_ -and
+                $_ -notmatch '^[│◇├╰╭╮╯]' -and
+                $_ -notmatch '^(Update history|Recorded warnings|WARNING:)'
+            } |
+            Select-Object -Last 1)
+
+        if ($candidate) { return [string]$candidate }
+    }
+
+    return $null
+}
+
+function Enroll-WindowsCuaWithBootstrap {
+    Step "Enrolling Windows CUA with a short-lived bootstrap credential"
+
+    $target = Get-AutomaticNodeJoinTarget
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        Warn "Could not mint a Windows node bootstrap credential automatically."
+        return $false
+    }
+
+    # Use --target-file so the short-lived bootstrap credential never appears
+    # in the Windows child-process command line or transcript.
+    $targetFile = Join-Path $env:TEMP ("openclaw-node-join-" + [guid]::NewGuid().ToString("N") + ".txt")
+    try {
+        [System.IO.File]::WriteAllText(
+            $targetFile,
+            $target.Trim(),
+            (New-Object System.Text.UTF8Encoding -ArgumentList $false)
+        )
+
+        Invoke-Native -FilePath "openclaw" -Arguments @("node","stop") -AllowFailure -Quiet | Out-Null
+        Invoke-Native -FilePath "openclaw" -Arguments @("node","uninstall") -AllowFailure -Quiet | Out-Null
+
+        $connect = Invoke-Native -FilePath "openclaw" -Arguments @(
+            "connect",
+            "--target-file",$targetFile,
+            "--service",
+            "--display-name","Windows CUA",
+            "--all-commands"
+        ) -AllowFailure -Quiet
+
+        if ($connect.ExitCode -ne 0) {
+            Warn "Short-lived Windows node bootstrap enrollment failed."
+            return $false
+        }
+
+        Start-Sleep -Seconds 6
+        if (Test-WindowsCuaConnected) {
+            Pass "Windows CUA enrolled with a durable paired-device credential."
+            return $true
+        }
+
+        Warn "Bootstrap enrollment completed but Windows CUA is not yet connected."
+        return $false
+    } finally {
+        # connect --target-file consumes/removes it on success. Delete it
+        # explicitly on all other paths.
+        Remove-Item -LiteralPath $targetFile -Force -ErrorAction SilentlyContinue
+        $target = $null
+    }
+}
+
+function Rebuild-WindowsCuaNode {
+    param([Parameter(Mandatory=$false)][string]$PackageFolder = "")
+
+    Step "Rebuilding Windows CUA node service without exposing the shared Gateway token"
+
+    Ensure-WindowsOpenClaw -SupportFolder $Script:RestoreSupportFolder -PackageFolder $PackageFolder
+
+    $pairedStateRestored = $false
+    if ($NewPC -and -not [string]::IsNullOrWhiteSpace($PackageFolder)) {
+        $pairedStateRestored = Restore-WindowsNodePairingState -PackageFolder $PackageFolder
+    }
 
     $enableCua = Invoke-Native -FilePath "openclaw" -Arguments @("plugins","enable","cua-computer") -AllowFailure
     if ($enableCua.ExitCode -ne 0) {
@@ -2511,86 +3225,67 @@ function Rebuild-WindowsCuaNode {
         Warn "CUA driver-artifact check returned non-zero."
     }
 
-    # Try to resolve the Gateway token automatically. If OpenClaw refuses non-interactive reveal, ask securely.
-    $token = ""
-    try {
-        $tok = Invoke-Wsl "openclaw gateway auth-token --show" -AllowFailure
-        if ($tok.ExitCode -eq 0) {
-            $lines = @($tok.Output -split "`r?`n" | Where-Object { $_.Trim() })
-            if ($lines.Count -gt 0) { $token = $lines[-1].Trim() }
-        }
-    } catch {}
+    # First try the durable paired-device credential already present on this
+    # Windows machine or restored from the backup. OpenClaw explicitly prefers
+    # the saved paired node credential for the saved Gateway endpoint.
+    Invoke-Native -FilePath "openclaw" -Arguments @("node","stop") -AllowFailure -Quiet | Out-Null
 
-    if ([string]::IsNullOrWhiteSpace($token) -or $token -match 'redact|token|error|usage') {
-        Warn "The Gateway token could not be safely resolved automatically."
-        if ($NonInteractive) {
-            Warn "Skipping Windows CUA node recreation in unattended mode."
-            return
-        }
-        $sec = Read-Host "Paste the current Gateway token (input will be hidden)" -AsSecureString
-        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-        try { $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
-    }
+    $nodeInstall = Invoke-Native -FilePath "openclaw" -Arguments @(
+        "node","install","--force",
+        "--host","127.0.0.1",
+        "--port","18789",
+        "--no-tls",
+        "--display-name","Windows CUA",
+        "--all-commands"
+    ) -AllowFailure
 
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        Warn "No Gateway token supplied; skipping Windows node installation."
-        return
-    }
-
-    $old = $env:OPENCLAW_GATEWAY_TOKEN
-    try {
-        $env:OPENCLAW_GATEWAY_TOKEN = $token
-
-        # Remove/reinstall only the service definition; do not install a Windows Gateway.
-        # "not running" during stop is an expected condition and must not abort repair.
-        Invoke-Native -FilePath "openclaw" -Arguments @("node","stop") -AllowFailure -Quiet | Out-Null
-
-        $nodeInstall = Invoke-Native -FilePath "openclaw" -Arguments @(
-            "node","install","--force",
-            "--host","127.0.0.1",
-            "--port","18789",
-            "--no-tls",
-            "--display-name","Windows CUA",
-            "--all-commands"
-        ) -AllowFailure
-
-        if ($nodeInstall.ExitCode -ne 0) {
-            Warn "Windows node service install returned exit code $($nodeInstall.ExitCode)."
-            return
-        }
-
+    if ($nodeInstall.ExitCode -eq 0) {
         $nodeStart = Invoke-Native -FilePath "openclaw" -Arguments @("node","start") -AllowFailure
-        if ($nodeStart.ExitCode -ne 0) {
-            Warn "Windows node start returned exit code $($nodeStart.ExitCode)."
+        if ($nodeStart.ExitCode -eq 0) {
+            Start-Sleep -Seconds 6
+            if (Test-WindowsCuaConnected) {
+                if ($pairedStateRestored) {
+                    Pass "Windows CUA reconnected using paired credential state restored from the backup."
+                } else {
+                    Pass "Windows CUA reconnected using its existing durable paired credential."
+                }
+            }
         }
-
-        Start-Sleep -Seconds 5
-        Pass "Windows CUA service installation/start command completed."
-    } finally {
-        if ($null -eq $old) { Remove-Item Env:OPENCLAW_GATEWAY_TOKEN -ErrorAction SilentlyContinue }
-        else { $env:OPENCLAW_GATEWAY_TOKEN = $old }
-        $token = $null
-    }
-
-    Step "Checking node from the WSL Gateway"
-    $nodes = Invoke-Wsl "openclaw nodes list" -AllowFailure
-    if ($nodes.ExitCode -ne 0) {
-        Warn "Could not query Gateway node registry."
     } else {
-        if ($nodes.Output -match "Windows CUA") {
-            Pass "Windows CUA appears in the Gateway node registry."
-        } else {
-            Warn "Windows CUA is not yet visible. A pairing approval may be required."
+        Warn "Windows node service install returned exit code $($nodeInstall.ExitCode)."
+    }
+
+    # If there was no reusable paired credential (or it was revoked), enroll
+    # with a short-lived bootstrap credential. This never reveals or persists
+    # the shared Gateway token.
+    if (-not (Test-WindowsCuaConnected)) {
+        Warn "Durable paired node credential was not sufficient; trying automatic bootstrap enrollment."
+        $enrolled = Enroll-WindowsCuaWithBootstrap
+
+        if (-not $enrolled) {
+            Warn "Automatic Windows node enrollment could not be completed."
+            Warn "The restored Gateway credential state is intact; no shared Gateway token has been lost."
+            Warn "Manual recovery, if needed: open an interactive WSL terminal and run:"
+            Write-Host "  ~/.openclaw/bin/openclaw gateway auth-token --show" -ForegroundColor Yellow
+            Write-Host "Then use the Windows Hub Connections/Devices flow or OpenClaw pairing flow." -ForegroundColor Yellow
+            return
         }
     }
 
-    $pending = Invoke-Wsl "openclaw nodes pending" -AllowFailure
-    if ($pending.Output -and $pending.Output -notmatch "No pending") {
-        Warn "A node pairing/capability approval may be pending. Review the output above and approve it in WSL."
+    Step "Checking Windows CUA from the WSL Gateway"
+    $nodes = Invoke-Wsl '"$HOME/.openclaw/bin/openclaw" nodes list --connected --json' -AllowFailure
+    if ($nodes.ExitCode -eq 0 -and $nodes.Output -match '(?i)Windows CUA') {
+        Pass "Windows CUA is connected to the restored Gateway."
+    } else {
+        Warn "Windows CUA is not currently shown as connected."
     }
 
-    $desc = Invoke-Wsl "openclaw nodes describe --node 'Windows CUA'" -AllowFailure
+    $pending = Invoke-Wsl '"$HOME/.openclaw/bin/openclaw" nodes pending' -AllowFailure
+    if ($pending.Output -and $pending.Output -notmatch "No pending") {
+        Warn "A command-surface expansion approval may still be pending; review the output above."
+    }
+
+    $desc = Invoke-Wsl '"$HOME/.openclaw/bin/openclaw" nodes describe --node "Windows CUA"' -AllowFailure
     if ($desc.ExitCode -eq 0) {
         $needed = @("system.run","screen.snapshot","computer.act")
         foreach ($n in $needed) {
@@ -2600,6 +3295,166 @@ function Rebuild-WindowsCuaNode {
     }
 }
 
+function Get-WindowsHubExecutable {
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "OpenClawTray\OpenClaw.Tray.WinUI.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\OpenClaw\OpenClaw.Tray.WinUI.exe")
+    )
+
+    foreach ($candidate in $candidates) {
+        try {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue) {
+                return $candidate
+            }
+        } catch {}
+    }
+    return $null
+}
+
+function Ensure-WindowsHub {
+    param(
+        [Parameter(Mandatory=$false)][string]$SupportFolder = "",
+        [Parameter(Mandatory=$false)][string]$PackageFolder = ""
+    )
+
+    Step "Checking OpenClaw Windows Hub companion"
+
+    $existing = Get-WindowsHubExecutable
+    if ($existing) {
+        Pass "OpenClaw Windows Hub is installed: $existing"
+        return
+    }
+
+    if (-not $NewPC) {
+        Warn "OpenClaw Windows Hub is not installed. It is optional for CLI-only restore."
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SupportFolder)) { $SupportFolder = New-RestoreSupportFolder }
+    if ([string]::IsNullOrWhiteSpace($PackageFolder)) { $PackageFolder = $RestorePackage }
+
+    Info "Installing the native OpenClaw Windows Hub companion for GUI/tray/chat/node mode."
+
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($arch)) { $arch = $env:PROCESSOR_ARCHITECTURE }
+
+    if ($arch -match '(?i)ARM64') { $hubArch = "arm64" }
+    else { $hubArch = "x64" }
+
+    $releaseApi = "https://api.github.com/repos/openclaw/openclaw-windows-node/releases/latest"
+    $installerName = "OpenClawCompanion-Setup-$hubArch.exe"
+
+    $tempDir = Join-Path $env:TEMP ("HatchIQ-OpenClawHub-" + [guid]::NewGuid().ToString("N"))
+    Ensure-Directory $tempDir
+
+    $installer = Join-Path $tempDir $installerName
+    $releaseJson = Join-Path $tempDir "latest-release.json"
+    $curl = Join-Path $env:WINDIR "System32\curl.exe"
+
+    try {
+        if (-not (Test-Path -LiteralPath $curl -PathType Leaf)) {
+            throw "Windows curl.exe is unavailable."
+        }
+
+        Step "Reading official OpenClaw Windows Hub release metadata"
+        $metaDownload = Invoke-Native -FilePath $curl -Arguments @(
+            "-L","--fail","--silent","--show-error",
+            "--retry","3","--retry-delay","2",
+            "-H","Accept: application/vnd.github+json",
+            "-H","X-GitHub-Api-Version: 2022-11-28",
+            "-o",$releaseJson,
+            $releaseApi
+        ) -AllowFailure
+
+        if ($metaDownload.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $releaseJson -PathType Leaf)) {
+            throw "Could not retrieve official Windows Hub release metadata from GitHub."
+        }
+
+        try {
+            $release = Get-Content -LiteralPath $releaseJson -Raw -ErrorAction Stop | ConvertFrom-Json
+        } catch {
+            throw "Windows Hub release metadata was not valid JSON: $($_.Exception.Message)"
+        }
+
+        $asset = @($release.assets | Where-Object { $_.name -eq $installerName } | Select-Object -First 1)
+        if (-not $asset -or [string]::IsNullOrWhiteSpace([string]$asset.browser_download_url)) {
+            throw "The latest Windows Hub release does not contain $installerName."
+        }
+
+        $downloadUrl = [string]$asset.browser_download_url
+        $expectedDigest = [string]$asset.digest
+        $releaseTag = [string]$release.tag_name
+
+        Info "Windows Hub release: $releaseTag"
+        Info "Installer asset: $installerName"
+
+        Step "Downloading signed OpenClaw Windows Hub installer"
+        $dlInstaller = Invoke-Native -FilePath $curl -Arguments @(
+            "-L","--fail","--show-error",
+            "--retry","3","--retry-delay","2",
+            "-o",$installer,
+            $downloadUrl
+        ) -AllowFailure
+
+        if ($dlInstaller.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Windows Hub installer download failed."
+        }
+
+        # GitHub release assets expose a digest field (for current releases this is
+        # sha256:<hex>). Use that authoritative per-asset digest instead of probing
+        # for a separate SHA256SUMS file that the Windows Hub project does not publish.
+        if (-not [string]::IsNullOrWhiteSpace($expectedDigest) -and
+            $expectedDigest -match '(?i)^sha256:([0-9a-f]{64})$') {
+            $expected = $Matches[1].ToLowerInvariant()
+            $actual = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+
+            if ($expected -ne $actual) {
+                throw "Windows Hub installer SHA-256 does not match GitHub release metadata."
+            }
+
+            Pass "Windows Hub installer SHA-256 verified against GitHub release metadata."
+        } else {
+            Warn "GitHub release metadata did not expose a SHA-256 digest; Authenticode validation will still be required."
+        }
+
+        Step "Validating Windows Hub code signature"
+        $sig = Get-AuthenticodeSignature -LiteralPath $installer
+        if ($sig.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "Windows Hub installer Authenticode signature is not valid: $($sig.Status)"
+        }
+        Pass "Windows Hub installer signature is valid."
+
+        Step "Installing OpenClaw Windows Hub companion"
+        # The official installer is Inno Setup. Silent mode avoids launching the
+        # first-run wizard during migration; the user can connect the Hub to the
+        # restored WSL Gateway after migration completes.
+        $hubInstall = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/SP-"
+        ) -Wait -PassThru
+
+        if ($hubInstall.ExitCode -ne 0) {
+            throw "Windows Hub installer exited with code $($hubInstall.ExitCode)."
+        }
+
+        $hubExe = Get-WindowsHubExecutable
+        if (-not $hubExe) {
+            throw "Windows Hub installer completed but OpenClaw.Tray.WinUI.exe was not found."
+        }
+
+        Pass "OpenClaw Windows Hub installed: $hubExe"
+        Info "The Hub was not auto-launched. After migration, open OpenClaw Companion and connect it to the restored Gateway."
+    } catch {
+        Warn "Automatic OpenClaw Windows Hub installation failed: $($_.Exception.Message)"
+        Warn "Windows Hub is optional for the core restore. Continuing with Gateway/CLI/node restore."
+        Warn "After migration, install OpenClaw Companion manually and connect it to the existing WSL Gateway."
+        return
+    } finally {
+        try { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
 
 function Ensure-RestorePrerequisites {
     param(
@@ -2618,51 +3473,58 @@ function Ensure-RestorePrerequisites {
     Ensure-WslForRestore -SupportFolder $SupportFolder -PackageFolder $PackageFolder
     Install-OpenClawWslIfMissing -SupportFolder $SupportFolder -PackageFolder $PackageFolder
     Ensure-WindowsOpenClaw -SupportFolder $SupportFolder -PackageFolder $PackageFolder
+    Ensure-WindowsHub -SupportFolder $SupportFolder -PackageFolder $PackageFolder
 
     Step "Verifying prerequisite versions"
 
     $wslVerifyCmd = @'
 set -e
 
-oc="$HOME/.openclaw/bin/openclaw"
-nodebin="$HOME/.openclaw/tools/node/bin/node"
+OC="$HOME/.openclaw/bin/openclaw"
+NODE="$HOME/.openclaw/tools/node/bin/node"
 
-test -x "$oc"
-test -x "$nodebin"
+test -x "$OC"
+test -x "$NODE"
 
-printf 'OPENCLAW_PATH=%s\n' "$oc"
-printf 'NODE_PATH=%s\n' "$nodebin"
+printf 'OPENCLAW_PATH=%s\n' "$OC"
+printf 'NODE_PATH=%s\n' "$NODE"
 
-"$oc" --version
-"$nodebin" --version
+"$OC" --version
+"$NODE" --version
 python3 --version
-printf 'PID1='
-ps -p 1 -o comm=
+
+PID1="$(ps -p 1 -o comm= | tr -d '[:space:]')"
+printf 'PID1=%s\n' "$PID1"
+test "$PID1" = "systemd"
 '@
 
     $wslVersion = Invoke-Wsl $wslVerifyCmd -AllowFailure
     if ($wslVersion.ExitCode -ne 0 -or
-        $wslVersion.Output -notmatch '(?m)^OPENCLAW_PATH=/(?!mnt/)' -or
-        $wslVersion.Output -notmatch '(?m)^NODE_PATH=/(?!mnt/)' -or
+        $wslVersion.Output -notmatch '(?m)^OPENCLAW_PATH=/' -or
+        $wslVersion.Output -notmatch '(?m)^NODE_PATH=/' -or
         $wslVersion.Output -notmatch '(?m)^OpenClaw ' -or
-        $wslVersion.Output -notmatch '(?m)^PID1=systemd') {
+        $wslVersion.Output -notmatch '(?m)^PID1=systemd$') {
 
         Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
             -Problem "WSL prerequisite verification failed after installation." `
             -ManualSteps @(
-                "Open the selected WSL distro.",
-                'Run: export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
-                "Run: command -v openclaw ; openclaw --version",
-                "Run: command -v node ; node --version",
-                "Run: python3 --version",
-                "Run: ps -p 1 -o comm=   (should say systemd)",
-                "Run CONTINUE-RESTORE.cmd."
+                'Open the selected WSL distro.',
+                'Run: $HOME/.openclaw/bin/openclaw --version',
+                'Run: $HOME/.openclaw/tools/node/bin/node --version',
+                'Run: python3 --version',
+                'Run: ps -p 1 -o comm=   (should say systemd)',
+                'Run CONTINUE-RESTORE.cmd.'
             )
         Fail "WSL prerequisite verification failed."
     }
 
-    $resolvedOpenClaw = ($wslVersion.Output -split "`r?`n" | Where-Object { $_ -like 'OPENCLAW_PATH=*' } | Select-Object -Last 1)
-    $resolvedNode = ($wslVersion.Output -split "`r?`n" | Where-Object { $_ -like 'NODE_PATH=*' } | Select-Object -Last 1)
+    $resolvedOpenClaw = ($wslVersion.Output -split "`r?`n" |
+        Where-Object { $_ -like 'OPENCLAW_PATH=*' } |
+        Select-Object -Last 1)
+    $resolvedNode = ($wslVersion.Output -split "`r?`n" |
+        Where-Object { $_ -like 'NODE_PATH=*' } |
+        Select-Object -Last 1)
+
     Pass "WSL native OpenClaw resolution: $resolvedOpenClaw"
     Pass "WSL native Node resolution: $resolvedNode"
 
@@ -2677,6 +3539,144 @@ ps -p 1 -o comm=
     Pass "OpenClaw is installed in WSL."
     Pass "OpenClaw is installed on Windows."
     Pass "Prerequisite preflight complete."
+}
+
+function Get-WindowsHubSetupCode {
+    $r = Invoke-Wsl `
+        -Command '"$HOME/.openclaw/bin/openclaw" qr --setup-code-only --url ws://127.0.0.1:18789' `
+        -AllowFailure -SensitiveOutput
+
+    if ($r.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($r.Output)) {
+        return $null
+    }
+
+    $lines = @($r.Output -split "`r?`n" |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ })
+
+    [array]::Reverse($lines)
+
+    foreach ($line in $lines) {
+        if ($line -notmatch '^[A-Za-z0-9_-]{80,}$') { continue }
+
+        try {
+            $padded = $line.Replace('-','+').Replace('_','/')
+            $mod = $padded.Length % 4
+            if ($mod -eq 2) { $padded += "==" }
+            elseif ($mod -eq 3) { $padded += "=" }
+            elseif ($mod -ne 0) { continue }
+
+            $bytes = [Convert]::FromBase64String($padded)
+            $jsonText = [System.Text.Encoding]::UTF8.GetString($bytes)
+            $obj = $jsonText | ConvertFrom-Json
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$obj.url) -and
+                -not [string]::IsNullOrWhiteSpace([string]$obj.bootstrapToken)) {
+                return $line
+            }
+        } catch {
+            continue
+        }
+    }
+
+    return $null
+}
+
+function Write-WindowsHubConnectionGuide {
+    param(
+        [Parameter(Mandatory=$true)][string]$SupportFolder
+    )
+
+    $distro = Normalize-WslDistroName $Script:SelectedDistro
+    if ([string]::IsNullOrWhiteSpace($distro)) { $distro = "<your WSL distro>" }
+
+    $guidePath = Join-Path $SupportFolder "CONNECT-WINDOWS-HUB.txt"
+
+    $guide = @"
+OPENCLAW WINDOWS HUB - CONNECT TO THE RESTORED WSL GATEWAY
+==========================================================
+
+IMPORTANT:
+- DO NOT click "Install" under "Get started: install a local gateway".
+- The migration already restored the real Gateway inside WSL.
+- Use the existing-Gateway connection flow instead.
+
+RECOMMENDED METHOD: SETUP CODE
+------------------------------
+1. Launch "OpenClaw Companion" from the Windows Start menu.
+
+2. On the Connection page, click:
+      Setup code
+   Do NOT choose "Install a local gateway".
+
+3. Open a separate Windows PowerShell window and enter the restored WSL distro:
+      wsl.exe -d $distro
+
+4. Inside WSL, generate a short-lived setup code:
+      ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789
+
+5. Copy the setup code printed in that WSL terminal.
+
+6. Back in OpenClaw Companion, paste the code into the Setup code box and connect.
+
+7. The Companion should change from "Disconnected" to connected/green.
+
+IF PAIRING APPROVAL IS REQUESTED
+--------------------------------
+Inside the restored WSL Gateway run:
+
+      ~/.openclaw/bin/openclaw devices list
+
+Approve the device request shown there:
+
+      ~/.openclaw/bin/openclaw devices approve <deviceRequestId>
+
+Windows node mode uses a SEPARATE command-surface approval. If node mode is pending:
+
+      ~/.openclaw/bin/openclaw nodes pending
+      ~/.openclaw/bin/openclaw nodes approve <nodeRequestId>
+
+Then restart Windows node mode / OpenClaw Companion so it reconnects.
+
+VERIFY WINDOWS CUA
+------------------
+Inside WSL:
+
+      ~/.openclaw/bin/openclaw nodes status
+      ~/.openclaw/bin/openclaw nodes describe --node "Windows CUA"
+
+The Windows Hub top bar should show Connected and the Windows CUA node should be present.
+
+DIRECT TOKEN METHOD (ALTERNATIVE)
+---------------------------------
+If you intentionally want to use Direct instead of Setup code:
+
+Gateway URL:
+      ws://127.0.0.1:18789
+
+Retrieve the configured shared token INTERACTIVELY inside WSL:
+      ~/.openclaw/bin/openclaw gateway auth-token --show
+
+Then in OpenClaw Companion choose:
+      Direct
+and enter the URL + token.
+
+Treat that token as a password. The Setup code method above is preferred because it uses a
+short-lived bootstrap credential instead of making you copy the shared Gateway token.
+
+ABOUT STALE DEVICE-AUTH WARNINGS
+--------------------------------
+A warning that an old cached node device credential no longer matches the active Gateway
+means the old Windows node pairing is stale. It does NOT mean the restored Gateway data is
+missing. Complete the Setup code/device/node approval flow above to establish a fresh valid
+pairing.
+
+RESTORED WSL DISTRO:
+      $distro
+"@
+
+    Set-Content -LiteralPath $guidePath -Value $guide -Encoding UTF8
+    return $guidePath
 }
 
 function Restore-MigrationKit {
@@ -2713,32 +3713,103 @@ function Restore-MigrationKit {
 
         $wslArchive = Convert-ToWslPath $archive.FullName
 
-        # Keep generated restore working files OUTSIDE the immutable backup package.
+        # Keep a human-readable restore script in the external restore log folder
+        # for debugging, but DO NOT execute that /mnt/c file. Read the exact script
+        # text and stream it to WSL bash over STDIN. The archive path is Bash $1.
         $restoreScript = Build-WslRestoreScript -PackageFolder $restoreLogFolder -ArchiveFile $archive.FullName
-        $wslRestoreScript = Convert-ToWslPath $restoreScript
-        $wslLog = "`$HOME/openclaw-migration-restore.log"
+        $restoreContent = [System.IO.File]::ReadAllText($restoreScript, [System.Text.Encoding]::UTF8)
 
         Step "Running staged WSL restore and activation"
-        $rr = Invoke-Wsl "chmod +x '$wslRestoreScript' && '$wslRestoreScript' '$wslArchive' '$wslLog'" -AllowFailure
+        $rr = Invoke-Wsl -Command $restoreContent -Arguments @($wslArchive) -AllowFailure
         if ($rr.ExitCode -ne 0) {
             Fail "WSL migration restore failed. Review the migration log and rollback/pre-restore locations printed above."
         }
         Pass "WSL state/workspace migration completed."
 
-        Rebuild-WindowsCuaNode
+        Rebuild-WindowsCuaNode -PackageFolder $package
 
         Step "Final end-to-end checks"
         Test-GatewayDeep -AllowFailure | Out-Null
-        $doctor = Invoke-Wsl "openclaw doctor" -AllowFailure
+        $doctor = Invoke-Wsl '"$HOME/.openclaw/bin/openclaw" doctor' -AllowFailure
         if ($doctor.ExitCode -eq 0) { Pass "Final OpenClaw Doctor completed." }
         else { Warn "Final Doctor returned non-zero; review output." }
 
         Pass "MIGRATION COMPLETE"
         Write-Host ""
+
+        $hubGuide = Write-WindowsHubConnectionGuide -SupportFolder $restoreLogFolder
+        $hubExe = Get-WindowsHubExecutable
+
+        if ($hubExe) {
+            Write-Host "OpenClaw Windows Hub is installed:" -ForegroundColor Green
+            Write-Host "  $hubExe" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "WINDOWS HUB: CONNECT IT TO THE RESTORED WSL GATEWAY" -ForegroundColor Cyan
+            Write-Host "---------------------------------------------------" -ForegroundColor Cyan
+            Write-Host "1. Launch 'OpenClaw Companion' from Start." -ForegroundColor White
+            Write-Host "2. DO NOT click 'Install' under 'install a local gateway'." -ForegroundColor Yellow
+            Write-Host "3. Click 'Setup code' under 'connect to an existing one'." -ForegroundColor White
+            Write-Host "4. Open a separate PowerShell window and run:" -ForegroundColor White
+            Write-Host "     wsl.exe -d $($Script:SelectedDistro)" -ForegroundColor Green
+            Write-Host "5. Inside WSL run:" -ForegroundColor White
+            Write-Host "     ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789" -ForegroundColor Green
+            Write-Host "6. Paste that short-lived setup code into OpenClaw Companion." -ForegroundColor White
+            Write-Host "7. If pairing is pending, approve device/node requests from WSL." -ForegroundColor White
+            Write-Host ""
+            Write-Host "Full GUI connection instructions:" -ForegroundColor Cyan
+            Write-Host "  $hubGuide" -ForegroundColor Green
+            Write-Host ""
+        } else {
+            Warn "Windows Hub is not installed. Core restore is complete."
+            Write-Host "GUI connection instructions were still written to:" -ForegroundColor Gray
+            Write-Host "  $hubGuide" -ForegroundColor Gray
+            Write-Host ""
+        }
+
         Write-Host "The source Windows node snapshot is preserved here for recovery/reference:" -ForegroundColor Gray
         Write-Host "  $(Join-Path $package 'Windows\windows-openclaw-state.zip')" -ForegroundColor Gray
         Write-Host ""
-        Warn "Do not delete the migration kit until you have tested sessions, channels, memory, plugins, and Windows CUA."
+        Warn "Do not delete the migration kit until you have tested sessions, channels, memory, plugins, Windows Hub, and Windows CUA."
+
+        if ($hubExe) {
+            Write-Host ""
+            Write-Host "Preparing a fresh short-lived Windows Hub setup code..." -ForegroundColor Cyan
+
+            # The setup code contains a short-lived bootstrap credential.
+            # Stop the PowerShell transcript BEFORE minting/printing it so the
+            # credential is visible to the user but is not persisted in tool-run.log.
+            Stop-RunLog
+
+            $setupCode = Get-WindowsHubSetupCode
+
+            Write-Host ""
+            Write-Host "============================================================" -ForegroundColor Cyan
+            Write-Host " OPENCLAW WINDOWS HUB - SETUP CODE" -ForegroundColor Cyan
+            Write-Host "============================================================" -ForegroundColor Cyan
+
+            if (-not [string]::IsNullOrWhiteSpace($setupCode)) {
+                Write-Host ""
+                Write-Host $setupCode -ForegroundColor Green
+                Write-Host ""
+                Write-Host "In OpenClaw Companion:" -ForegroundColor White
+                Write-Host "  Connection -> Setup code -> paste the code above -> Connect" -ForegroundColor Green
+                Write-Host ""
+                Write-Host "This is a short-lived bootstrap credential. If it expires, regenerate it in WSL with:" -ForegroundColor Yellow
+                Write-Host "  ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789" -ForegroundColor Yellow
+            } else {
+                Write-Host ""
+                Write-Host "The toolkit could not mint the setup code automatically." -ForegroundColor Yellow
+                Write-Host "Open WSL and run:" -ForegroundColor White
+                Write-Host "  ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789" -ForegroundColor Green
+            }
+
+            Write-Host ""
+            Write-Host "DO NOT click 'Install a local gateway' in the Windows Hub." -ForegroundColor Yellow
+            Write-Host "Use the restored WSL Gateway at ws://127.0.0.1:18789." -ForegroundColor White
+            Write-Host "============================================================" -ForegroundColor Cyan
+
+            $setupCode = $null
+        }
 
     } finally {
         Stop-RunLog
@@ -3370,7 +4441,39 @@ function Show-Diagnostics {
     }
 }
 
+function Test-ToolkitRuntimeCompatibility {
+    Step "Toolkit runtime compatibility check"
+
+    if ($PSVersionTable.PSVersion.Major -lt 5) {
+        Fail "Windows PowerShell 5.1 or newer is required."
+    }
+
+    $psiTest = New-Object System.Diagnostics.ProcessStartInfo
+    foreach ($name in @(
+        "FileName",
+        "Arguments",
+        "UseShellExecute",
+        "RedirectStandardInput",
+        "RedirectStandardOutput",
+        "RedirectStandardError"
+    )) {
+        if ($psiTest.PSObject.Properties.Name -notcontains $name) {
+            Fail "Required .NET ProcessStartInfo property is missing: $name"
+        }
+    }
+
+    $utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false
+    $bytes = $utf8.GetBytes("test")
+    if ($bytes.Length -ne 4) {
+        Fail "UTF-8 no-BOM runtime self-test failed."
+    }
+
+    Pass "Windows PowerShell/.NET runtime is compatible with toolkit transport."
+}
+
 function Main {
+    Test-ToolkitRuntimeCompatibility
+
     $packageBesideScript = $false
     try {
         $packageBesideScript = Test-Path -LiteralPath (Join-Path $PSScriptRoot "package-manifest.json") -PathType Leaf

@@ -1,1 +1,1 @@
-55474b2f1f63573dfd19aff156ab4c80ba061c43a8413aa747311484a969af43  OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip
+be8c1999a1cd1777eca55b8cdbc2f7362f6246851eabdc479fa66eca7cb3f955  OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip

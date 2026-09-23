@@ -1,26 +1,230 @@
-OpenClaw Backup & Migration Toolkit v1.10.6
+OpenClaw Backup & Migration Toolkit v1.12.2
 =============================================
 
-FUNDAMENTAL WSL SCRIPT-TRANSPORT FIX
-------------------------------------
-The latest failure was not another failed OpenClaw installation.
+AUTOMATIC WINDOWS HUB SETUP CODE
+--------------------------------
+After a successful NEW-PC migration, the toolkit now automatically mints the same short-lived
+Hub Setup code you would otherwise create manually with:
 
-Immediately before the failure, the toolkit successfully executed the canonical WSL
-OpenClaw and private Node binaries. The later prerequisite script then printed empty
-OPENCLAW_PATH/NODE_PATH variables.
+    ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789
 
-v1.10.6 fixes the transport itself. Every toolkit WSL command is now written to a temporary
-UTF-8/no-BOM, LF-only Bash file and executed with:
+The final screen prints the code prominently and tells you to use:
 
-    wsl.exe -d <distro> -- bash --noprofile --norc <script-file>
+    OpenClaw Companion -> Connection -> Setup code
 
-The Bash source is no longer embedded in a Windows native command-line argument, so shell
-variables, quotes, command substitution, pipes, and multiline syntax are preserved.
+The toolkit validates that the extracted code decodes to an OpenClaw setup payload containing
+the Gateway URL and bootstrapToken.
 
-The same transport is used for root-level WSL setup, and a transport self-test runs before
-the OpenClaw prerequisite phase.
+For security, the PowerShell transcript is stopped before the code is generated or printed.
+The setup credential is therefore not written into tool-run.log or bundled back into the
+backup package.
 
-The generated fallback guide also preserves Linux `$HOME` literally.
+If the short-lived code expires, the final screen also shows the one-line command to mint
+another one.
+
+WINDOWS HUB POST-MIGRATION CONNECTION GUIDE
+--------------------------------------------
+After migration, the toolkit now prints and writes the exact steps required to connect
+OpenClaw Windows Hub / OpenClaw Companion to the restored WSL Gateway.
+
+The recommended method is Setup code:
+
+    ~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789
+
+The Hub should connect to the already-restored WSL Gateway. Do not choose the Hub option
+that installs another local Gateway.
+
+The restore-log folder receives:
+
+    CONNECT-WINDOWS-HUB.txt
+
+with the exact WSL distro name and device/node approval commands.
+
+NO MORE GATEWAY-TOKEN PASTE DURING WINDOWS CUA RESTORE
+-------------------------------------------------------
+The shared Gateway token was not actually missing from OpenClaw's supported backup. The WSL
+archive contains state/config/credentials, including configured Gateway authentication
+secret state.
+
+The failure was in the toolkit's Windows-node rebuild: it tried to reveal that protected
+Gateway secret non-interactively. OpenClaw intentionally refuses that operation.
+
+v1.12.0 no longer tries to reveal or duplicate the shared Gateway bearer token.
+
+Instead, backup/migration captures the Windows node's own durable paired identity from:
+
+    %USERPROFILE%\.openclaw\state\openclaw.sqlite
+
+That database carries the node identity, saved Gateway connection, paired device credential,
+and local exec approvals.
+
+On a new PC the toolkit restores that state first, verifies the node identity, and rebuilds
+the Windows CUA service. The node reconnects with its durable paired-device credential.
+
+If that credential cannot be reused, the toolkit automatically mints a SHORT-LIVED OpenClaw
+bootstrap credential and enrolls the Windows node with `openclaw connect --target-file`.
+The shared Gateway bearer token never needs to be displayed or pasted.
+
+Existing older Hatch IQ backup packages that already contain:
+
+    Windows\windows-openclaw-state.zip
+
+can use this new restore engine; you do not need to recreate the WSL backup archive.
+
+MANUAL TOKEN RECOVERY
+---------------------
+If you ever intentionally need to see the shared Gateway token, OpenClaw requires an
+interactive terminal on the Gateway host:
+
+    ~/.openclaw/bin/openclaw gateway auth-token --show
+
+The migration tool no longer requires this for normal Windows CUA restoration.
+
+WINDOWS HUB CHECKSUM 404 FIX
+----------------------------
+The Windows Hub release currently publishes installer assets such as:
+
+    OpenClawCompanion-Setup-x64.exe
+    OpenClawCompanion-Setup-arm64.exe
+
+but not the previously guessed:
+
+    OpenClawCompanion-SHA256SUMS.txt
+
+v1.11.1 no longer requests that nonexistent file.
+
+Instead, it reads the official GitHub latest-release metadata, finds the exact installer
+asset for the current CPU architecture, downloads its published browser_download_url, and
+verifies the file against GitHub's per-asset SHA-256 digest when available.
+
+Authenticode signature verification remains mandatory.
+
+No core restore/activation behavior changed from v1.11.0.
+
+WINDOWS POWERSHELL 5.1 FIX + SANDBOX END-TO-END RESTORE TEST
+-------------------------------------------------------------
+v1.10.9 used a ProcessStartInfo property that is not present in Windows PowerShell 5.1's
+.NET Framework runtime.
+
+v1.11.0 writes the WSL Bash program as raw UTF-8-no-BOM bytes directly to stdin instead.
+
+This build also executes the generated restore shell in an isolated Linux sandbox before
+packaging. The synthetic test covers archive verification, pre-restore backup, staging,
+manifest discovery, transactional activation, rollback preservation, doctor/update repair,
+Gateway install/start, final health, and verifies that BACKUP-DATA-RELOADED is present in
+the final restored ~/.openclaw tree.
+
+A second test deliberately removes a staged asset and confirms the existing live state is
+not modified.
+
+The Windows Hub GUI install is best-effort and no longer blocks the core restore.
+
+POWERSHELL PARSER + WINDOWS HUB FIX
+-----------------------------------
+v1.10.8 had one fatal PowerShell source bug:
+
+    return "'" + ($Value -replace "'", "'\"'\"'") + "'"
+
+That is C-style quote escaping and is invalid Windows PowerShell 5.1 syntax. Because it was
+a parser error, PowerShell then misread the embedded Bash here-string as PowerShell and
+reported a cascade of bogus redirection/function errors.
+
+v1.10.9 removes Quote-Bash entirely.
+
+WSL Bash programs are streamed over STDIN. Positional values such as the archive path are
+now passed separately after:
+
+    bash -s --
+
+and arrive as normal Bash $1, $2, ... values. No shell-quoting helper is needed.
+
+WINDOWS GUI / COMPANION
+-----------------------
+The native GUI is OpenClaw Windows Hub / OpenClaw Companion. It is a separate application
+from the Windows OpenClaw CLI.
+
+On NEW-PC flows, the toolkit now detects and installs the official signed Windows Hub
+companion silently if it is missing. It deliberately does not launch first-run onboarding
+during restore.
+
+After migration, launch OpenClaw Companion from the Start menu and connect it to the
+already-restored local/WSL Gateway. Do not choose the option that creates a second local
+Gateway.
+
+RESTORE ACTIVATION HARDENING
+----------------------------
+This version fixes the three restore-stage failures reported together:
+
+1. Duplicated staged asset path:
+   `<stage>/<backup-name>/<backup-name>/payload/...`
+2. UTF-8 BOM before the Linux shebang:
+   `﻿#!/usr/bin/env: No such file or directory`
+3. Literal Linux log path:
+   `tee: '$HOME/openclaw-migration-restore.log': No such file or directory`
+
+The asset activator now resolves archivePath against the actual restore staging root and
+validates every asset before touching live state.
+
+Activation is transactional:
+- resolve and validate all sources;
+- pre-copy all replacement assets;
+- only then move existing live assets into rollback storage;
+- atomically swap prepared replacements into place;
+- automatically restore already-swapped destinations if a later swap fails.
+
+The generated Linux restore script is now UTF-8 without BOM and is explicitly invoked through
+bash. Linux `$HOME` is expanded inside Linux rather than being passed as a literal from
+PowerShell.
+
+WSL DISTRO IDENTITY / LAUNCH FIX
+--------------------------------
+A distro can be printed as:
+
+    Ubuntu-24.04
+
+yet still contain an invisible BOM or Unicode format/control character captured from
+`wsl.exe -l -q` under Windows PowerShell 5.1. Passing that invisible character back to WSL
+causes:
+
+    WSL_E_DISTRO_NOT_FOUND
+
+v1.10.7 now normalizes every distro name, performs a real `/bin/true` launch probe before
+trusting it, retries the normalized distro list, and on NEW-PC migration can automatically
+provision a fresh dedicated OpenClawGateway distro if all listed entries are stale/broken.
+
+It also repairs and syntax-checks the generated full restore shell script so later restore
+steps do not hit a latent malformed-if bug.
+
+WSL SHELL TRANSPORT FIX
+-----------------------
+The latest log proved OpenClaw and Node were installed correctly:
+
+    ~/.openclaw/bin/openclaw
+    ~/.openclaw/tools/node/bin/node
+
+and both binaries successfully returned their versions.
+
+The later prerequisite check nevertheless received blank paths. The recurring root cause was
+the way complex Bash source was transported from Windows PowerShell through wsl.exe as one
+`bash -lc <command>` argument.
+
+v1.10.6 fixes this upstream.
+
+All toolkit WSL scripts are now executed by:
+
+    wsl.exe -d <distro> -- bash -s
+
+with the Bash source streamed through STDIN. Complex Bash is no longer placed on the Windows
+command line at all.
+
+This removes the entire class of Windows quoting/reparsing problems that produced the prior:
+- `/dev/null` Windows redirection bug
+- malformed `case` syntax
+- command-substitution parser errors
+- empty canonical path variables
+
+The verification path is also simpler: it executes the known canonical Linux OpenClaw and
+private Node binaries directly.
 
 WSL OPENCLAW DETECTION FIX
 --------------------------
