@@ -1,0 +1,117 @@
+name: Publish v1.10.6
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".release/v1.10.6/**"
+      - ".github/workflows/publish-v1.10.6.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-v1.10.6
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild and verify v1.10.6 toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="/tmp/OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip"
+          EXPECTED="55474b2f1f63573dfd19aff156ab4c80ba061c43a8413aa747311484a969af43"
+          SIZE="50460"
+
+          test "$(find .release/v1.10.6 -maxdepth 1 -name 'tool.zip.b64.*' | wc -l)" -eq 5
+          cat .release/v1.10.6/tool.zip.b64.* | tr -d '\r\n' | base64 --decode > "$ZIP"
+          echo "$EXPECTED  $ZIP" | sha256sum -c -
+          test "$(stat -c%s "$ZIP")" -eq "$SIZE"
+          unzip -t "$ZIP"
+
+          rm -rf /tmp/openclaw-toolkit
+          mkdir -p /tmp/openclaw-toolkit
+          unzip -q "$ZIP" -d /tmp/openclaw-toolkit
+
+          SRC="/tmp/openclaw-toolkit/OpenClaw_Backup_Migration_Toolkit"
+          test -f "$SRC/OpenClaw-Backup-Migrate.ps1"
+          test -f "$SRC/OpenClaw-Backup-Migrate.cmd"
+          test -f "$SRC/README.txt"
+          test -f "$SRC/CHANGELOG.txt"
+          test -f "$SRC/RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd"
+          test -f "$SRC/CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd"
+          grep -F '$Script:ToolVersion = "1.10.6"' "$SRC/OpenClaw-Backup-Migrate.ps1"
+          grep -F 'function Invoke-WslScriptTransport' "$SRC/OpenClaw-Backup-Migrate.ps1"
+          grep -F 'WSL_SCRIPT_TRANSPORT_OK=A:B:C D' "$SRC/OpenClaw-Backup-Migrate.ps1"
+
+          if grep -F '"--","bash","-lc"' "$SRC/OpenClaw-Backup-Migrate.ps1"; then
+            echo "Unsafe inline bash -lc transport is still present."
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "$ZIP" dist/OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip
+          cp "$SRC/OpenClaw-Backup-Migrate.ps1" ./OpenClaw-Backup-Migrate.ps1
+          cp "$SRC/OpenClaw-Backup-Migrate.cmd" ./OpenClaw-Backup-Migrate.cmd
+          cp "$SRC/README.txt" ./TOOLKIT-README.txt
+          cp "$SRC/RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd" ./RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd
+          cp "$SRC/CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd" ./CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd
+
+          ACTUAL="$(sha256sum dist/OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip | awk '{print $1}')"
+          test "$ACTUAL" = "$EXPECTED"
+          echo "Verified SHA-256: $ACTUAL"
+
+      - name: Commit verified release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            OpenClaw-Backup-Migrate.ps1 \
+            OpenClaw-Backup-Migrate.cmd \
+            TOOLKIT-README.txt \
+            RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd \
+            CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd \
+            dist/OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip
+          if ! git diff --cached --quiet; then
+            git commit -m "Materialize verified Hatch IQ OpenClaw Toolkit v1.10.6"
+            git push origin HEAD:main
+          fi
+
+      - name: Create or refresh GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="dist/OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip"
+          if gh release view v1.10.6 >/dev/null 2>&1; then
+            gh release upload v1.10.6 "$ZIP" --clobber
+            gh release edit v1.10.6 \
+              --title "Hatch IQ OpenClaw Toolkit v1.10.6" \
+              --notes-file RELEASE_NOTES_v1.10.6.md \
+              --target main
+          else
+            gh release create v1.10.6 "$ZIP" \
+              --title "Hatch IQ OpenClaw Toolkit v1.10.6" \
+              --notes-file RELEASE_NOTES_v1.10.6.md \
+              --target main
+          fi
+
+      - name: Verify release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v1.10.6 --json tagName,name,url,assets
