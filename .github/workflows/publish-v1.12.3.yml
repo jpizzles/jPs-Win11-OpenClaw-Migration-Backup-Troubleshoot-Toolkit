@@ -1,0 +1,150 @@
+name: Publish v1.12.3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".release/v1.12.3/**"
+      - ".github/workflows/publish-v1.12.3.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply and verify v1.12.3 source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .release/v1.12.3/v1.12.3.patch
+          git apply .release/v1.12.3/v1.12.3.patch
+
+          grep -F '$Script:ToolVersion = "1.12.3"' OpenClaw-Backup-Migrate.ps1
+          grep -F 'OPTION B - CONNECT THIS NEW PC TO AN EXISTING REMOTE GATEWAY' OpenClaw-Backup-Migrate.ps1
+          grep -F 'wss://<gateway-host>.<tailnet>.ts.net' OpenClaw-Backup-Migrate.ps1
+          grep -F 'tailscale serve status' OpenClaw-Backup-Migrate.ps1
+
+      - name: Build and verify distribution ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="/tmp/v1123/OpenClaw_Backup_Migration_Toolkit"
+          ZIP="/tmp/OpenClaw_Backup_Migration_Toolkit_v1.12.3.zip"
+
+          rm -rf /tmp/v1123
+          mkdir -p "$ROOT"
+
+          cp OpenClaw-Backup-Migrate.ps1 "$ROOT/"
+          cp OpenClaw-Backup-Migrate.cmd "$ROOT/"
+          cp TOOLKIT-README.txt "$ROOT/README.txt"
+          tail -n +3 CHANGELOG.md > "$ROOT/CHANGELOG.txt"
+
+          if test -f RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd; then
+            cp RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd "$ROOT/"
+          fi
+          if test -f CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd; then
+            cp CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd "$ROOT/"
+          fi
+
+          (
+            cd /tmp/v1123
+            zip -X -q -r "$ZIP" OpenClaw_Backup_Migration_Toolkit
+          )
+
+          unzip -t "$ZIP"
+          unzip -p "$ZIP" OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.ps1 \
+            | grep -F '$Script:ToolVersion = "1.12.3"'
+
+          SHA="$(sha256sum "$ZIP" | awk '{print $1}')"
+          SIZE="$(stat -c%s "$ZIP")"
+          echo "RELEASE_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "RELEASE_SIZE=$SIZE" >> "$GITHUB_ENV"
+
+          mkdir -p dist
+          cp "$ZIP" dist/OpenClaw_Backup_Migration_Toolkit_v1.12.3.zip
+
+          printf 'Hatch IQ OpenClaw Backup, Migration & Recovery Toolkit\nLatest: v1.12.3\nSHA-256: %s\n' "$SHA" > LATEST.txt
+          printf '%s  OpenClaw_Backup_Migration_Toolkit_v1.12.3.zip\n' "$SHA" > SHA256SUMS.txt
+
+          python3 - "$SHA" <<'PY'
+          import re, sys
+          from pathlib import Path
+
+          sha = sys.argv[1]
+
+          readme = Path("README.md")
+          text = readme.read_text(encoding="utf-8")
+          text = re.sub(
+              r'SHA-256: `[0-9a-f]{64}`',
+              f'SHA-256: `{sha}`',
+              text,
+              count=1,
+          )
+          readme.write_text(text, encoding="utf-8")
+
+          notes = Path("RELEASE_NOTES_v1.12.3.md")
+          text = notes.read_text(encoding="utf-8")
+          text = re.sub(
+              r'`[0-9a-f]{64}`\s*$',
+              f'`{sha}`\n',
+              text,
+              count=1,
+              flags=re.M,
+          )
+          notes.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Commit verified v1.12.3 files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            OpenClaw-Backup-Migrate.ps1 \
+            TOOLKIT-README.txt \
+            CHANGELOG.md \
+            README.md \
+            RELEASE_NOTES_v1.12.3.md \
+            LATEST.txt \
+            SHA256SUMS.txt \
+            dist/OpenClaw_Backup_Migration_Toolkit_v1.12.3.zip
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Materialize verified Hatch IQ OpenClaw Toolkit v1.12.3"
+            git push origin HEAD:main
+          fi
+
+      - name: Create or refresh GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="dist/OpenClaw_Backup_Migration_Toolkit_v1.12.3.zip"
+
+          if gh release view v1.12.3 >/dev/null 2>&1; then
+            gh release upload v1.12.3 "$ZIP" --clobber
+          else
+            gh release create v1.12.3 "$ZIP" \
+              --title "Hatch IQ OpenClaw Toolkit v1.12.3" \
+              --notes-file RELEASE_NOTES_v1.12.3.md \
+              --target main
+          fi
+
+      - name: Verify release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v1.12.3 --json tagName,name,url,assets
