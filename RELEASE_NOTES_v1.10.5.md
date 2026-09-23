@@ -18,4 +18,4 @@ Changes:
 
 All earlier Windows installer, WSL path-isolation, deterministic WSL provisioning, backup/migration verification, fallback/resume, and reset/repair fixes remain intact.
 
-SHA-256: `42677448fff437a6f0bcc18b3c3a355ce55c2d514f46f325211f86569ac59d56`
+GitHub release ZIP SHA-256: `cd23ebc47b42d5c0fc48e5d5b18ec98c2e4914d26ee4909dd6f36ea1ad81afcc`
