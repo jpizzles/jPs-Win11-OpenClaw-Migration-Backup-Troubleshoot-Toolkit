@@ -32,7 +32,7 @@ Set-StrictMode -Version 2
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$Script:ToolVersion = "1.12.2"
+$Script:ToolVersion = "1.12.3"
 $Script:CurrentLog = $null
 
 $Script:SelectedDistro = $null
@@ -1229,8 +1229,43 @@ Alternative Direct method:
 Prefer Setup code because it uses a short-lived bootstrap credential instead of requiring
 you to copy the shared Gateway bearer token.
 
+CONNECTING THIS NEW PC TO AN EXISTING REMOTE GATEWAY
+-----------------------------------------------------
+If the real/authoritative Gateway is still running on another computer:
+
+1. On the EXISTING Gateway host:
+     tailscale serve status
+
+   If it already shows a tailnet-only HTTPS endpoint proxying to:
+     http://127.0.0.1:18789
+   DO NOT run tailscale serve again.
+
+2. On the new PC:
+     OpenClaw Companion -> Connection -> Direct
+
+3. URL:
+     wss://<gateway-host>.<tailnet>.ts.net
+
+4. On the EXISTING Gateway host, retrieve the token interactively:
+     ~/.openclaw/bin/openclaw gateway auth-token --show
+
+5. Paste the token only into Companion and connect.
+
+6. If approval is requested on the EXISTING Gateway:
+     ~/.openclaw/bin/openclaw devices list
+     ~/.openclaw/bin/openclaw devices approve <deviceRequestId>
+
+7. If Windows node/CUA approval is requested:
+     ~/.openclaw/bin/openclaw nodes pending
+     ~/.openclaw/bin/openclaw nodes approve <nodeRequestId>
+
+If a shared token was exposed, rotate it on the EXISTING Gateway host:
+     ~/.openclaw/bin/openclaw doctor --generate-gateway-token
+     ~/.openclaw/bin/openclaw gateway restart
+     ~/.openclaw/bin/openclaw gateway auth-token --show
+
 The restore also writes CONNECT-WINDOWS-HUB.txt into the external restore-log folder with
-the exact WSL distro name used on that PC.
+the exact WSL distro name used on that PC and both local/remote connection methods.
 
 At the very end of a successful NEW-PC migration, if Windows Hub is installed, the toolkit
 also mints a fresh short-lived Setup code automatically and prints it prominently for
@@ -1384,10 +1419,27 @@ OPENCLAW MIGRATION KIT
        ~/.openclaw/bin/openclaw nodes describe --node "Windows CUA"
 
 6. The restore writes CONNECT-WINDOWS-HUB.txt into Documents\OpenClaw-Restore-Logs\<run> with the exact distro name.
-7. At the very end of a successful migration, the toolkit automatically prints a fresh short-lived Hub Setup code.
-   In OpenClaw Companion choose Connection -> Setup code, paste it, and connect.
+7. At the very end of a successful migration, the toolkit automatically prints a fresh short-lived Hub Setup code
+   for the RESTORED LOCAL WSL Gateway. In OpenClaw Companion choose Connection -> Setup code, paste it, and connect.
    The transcript is stopped before the code is generated, so the bootstrap credential is not persisted in tool-run.log.
-8. Keep this folder private: it contains credentials and session history.
+
+8. If this new PC should instead attach to an EXISTING Gateway on another computer:
+   - verify that host's Tailscale Serve with:
+       tailscale serve status
+   - if it is already proxying tailnet HTTPS to http://127.0.0.1:18789, DO NOT run serve again;
+   - on the new PC choose OpenClaw Companion -> Connection -> Direct;
+   - URL:
+       wss://<gateway-host>.<tailnet>.ts.net
+   - retrieve the token interactively on the EXISTING Gateway host:
+       ~/.openclaw/bin/openclaw gateway auth-token --show
+   - paste it into Companion, connect, and approve device/node requests on the EXISTING Gateway host.
+
+9. If the existing Gateway token was exposed, rotate it there:
+       ~/.openclaw/bin/openclaw doctor --generate-gateway-token
+       ~/.openclaw/bin/openclaw gateway restart
+       ~/.openclaw/bin/openclaw gateway auth-token --show
+
+10. Keep this folder private: it contains credentials and session history.
 
 The Windows\windows-openclaw-state.zip file contains the source Windows node's paired identity/credential state.
 The current restore engine uses that snapshot to recover durable Windows CUA pairing when possible. If the old
@@ -3593,8 +3645,16 @@ function Write-WindowsHubConnectionGuide {
     $guidePath = Join-Path $SupportFolder "CONNECT-WINDOWS-HUB.txt"
 
     $guide = @"
-OPENCLAW WINDOWS HUB - CONNECT TO THE RESTORED WSL GATEWAY
-==========================================================
+OPENCLAW WINDOWS HUB - CONNECT AFTER MIGRATION
+==============================================
+
+You now have TWO possible connection topologies.
+
+======================================================================
+OPTION A - CONNECT TO THE RESTORED LOCAL WSL GATEWAY ON THIS NEW PC
+======================================================================
+
+Use this when this new PC should run its own restored OpenClaw Gateway.
 
 IMPORTANT:
 - DO NOT click "Install" under "Get started: install a local gateway".
@@ -3626,9 +3686,6 @@ IF PAIRING APPROVAL IS REQUESTED
 Inside the restored WSL Gateway run:
 
       ~/.openclaw/bin/openclaw devices list
-
-Approve the device request shown there:
-
       ~/.openclaw/bin/openclaw devices approve <deviceRequestId>
 
 Windows node mode uses a SEPARATE command-surface approval. If node mode is pending:
@@ -3647,8 +3704,8 @@ Inside WSL:
 
 The Windows Hub top bar should show Connected and the Windows CUA node should be present.
 
-DIRECT TOKEN METHOD (ALTERNATIVE)
----------------------------------
+DIRECT TOKEN METHOD FOR THE LOCAL RESTORED GATEWAY
+--------------------------------------------------
 If you intentionally want to use Direct instead of Setup code:
 
 Gateway URL:
@@ -3661,17 +3718,94 @@ Then in OpenClaw Companion choose:
       Direct
 and enter the URL + token.
 
-Treat that token as a password. The Setup code method above is preferred because it uses a
-short-lived bootstrap credential instead of making you copy the shared Gateway token.
+Treat that token as a password. Setup code is preferred because it uses a short-lived
+bootstrap credential instead of making you copy the shared Gateway token.
+
+======================================================================
+OPTION B - CONNECT THIS NEW PC TO AN EXISTING REMOTE GATEWAY
+======================================================================
+
+Use this when the authoritative Gateway is still running on another computer, and this new
+PC should attach to that existing Gateway instead of using the restored local WSL Gateway.
+
+Typical example:
+- Existing/original Gateway host: EGGDEV
+- Tailscale Serve already exposes the Gateway on the tailnet
+- Windows Hub on this new PC connects directly to that remote Gateway
+
+IMPORTANT:
+- If Tailscale Serve is ALREADY configured correctly on the existing Gateway host, DO NOT
+  run `tailscale serve` again.
+- DO NOT install another Gateway from the Windows Hub.
+- Select/create the REMOTE connection in Windows Hub when you want to use the original agent.
+
+1. On the EXISTING Gateway host, verify Tailscale Serve:
+      tailscale serve status
+
+   You want to see a tailnet-only HTTPS endpoint proxying to:
+      http://127.0.0.1:18789
+
+   Example shape:
+      https://<gateway-host>.<tailnet>.ts.net
+      |-- / proxy http://127.0.0.1:18789
+
+2. On THIS NEW PC, launch OpenClaw Companion and choose:
+      Connection -> Direct
+
+3. For Gateway URL, enter the existing host's Tailscale Serve URL using WSS:
+      wss://<gateway-host>.<tailnet>.ts.net
+
+   Example:
+      wss://eggdev.tail388a29.ts.net
+
+4. On the EXISTING Gateway host, open an INTERACTIVE WSL terminal and retrieve the shared
+   Gateway token:
+      ~/.openclaw/bin/openclaw gateway auth-token --show
+
+   Paste that token only into the Windows Hub token field. Treat it like a password.
+   Do NOT paste it into chat, screenshots, logs, scripts, or README files.
+
+5. Click Connect.
+
+6. If Windows Hub says Awaiting approval, approve the new device on the EXISTING Gateway:
+      ~/.openclaw/bin/openclaw devices list
+      ~/.openclaw/bin/openclaw devices approve <deviceRequestId>
+
+7. If this Windows PC will also act as a Windows CUA/node against that existing Gateway,
+   approve the separate node command surface if requested:
+      ~/.openclaw/bin/openclaw nodes pending
+      ~/.openclaw/bin/openclaw nodes approve <nodeRequestId>
+
+8. Select the remote connection in Windows Hub. The local:
+      ws://127.0.0.1:18789
+   and the remote:
+      wss://<gateway-host>.<tailnet>.ts.net
+   are separate Gateway connections.
+
+IF THE REMOTE GATEWAY TOKEN WAS EXPOSED
+---------------------------------------
+Rotate it on the EXISTING Gateway host:
+
+      ~/.openclaw/bin/openclaw doctor --generate-gateway-token
+      ~/.openclaw/bin/openclaw gateway restart
+      ~/.openclaw/bin/openclaw gateway auth-token --show
+
+Then update the token in every client that uses the shared token.
+
+OpenClaw may report that a healthy SecretRef does not need regeneration. Follow Doctor's
+result rather than weakening a SecretRef-backed configuration.
 
 ABOUT STALE DEVICE-AUTH WARNINGS
 --------------------------------
 A warning that an old cached node device credential no longer matches the active Gateway
-means the old Windows node pairing is stale. It does NOT mean the restored Gateway data is
-missing. Complete the Setup code/device/node approval flow above to establish a fresh valid
-pairing.
+means the old Windows node pairing is stale. It does NOT mean restored Gateway data is
+missing.
 
-RESTORED WSL DISTRO:
+- For the restored LOCAL Gateway: complete Option A Setup code/device/node approval.
+- For an EXISTING REMOTE Gateway: connect to the remote WSS URL with that remote Gateway's
+  auth, then approve device/node requests on the REMOTE Gateway host.
+
+RESTORED LOCAL WSL DISTRO:
       $distro
 "@
 
@@ -3756,8 +3890,16 @@ function Restore-MigrationKit {
             Write-Host "6. Paste that short-lived setup code into OpenClaw Companion." -ForegroundColor White
             Write-Host "7. If pairing is pending, approve device/node requests from WSL." -ForegroundColor White
             Write-Host ""
-            Write-Host "Full GUI connection instructions:" -ForegroundColor Cyan
+            Write-Host "Full GUI connection instructions (LOCAL restored Gateway + EXISTING REMOTE Gateway/Tailscale):" -ForegroundColor Cyan
             Write-Host "  $hubGuide" -ForegroundColor Green
+            Write-Host ""
+            Write-Host "If this PC should attach to an EXISTING Gateway on another machine:" -ForegroundColor Cyan
+            Write-Host "  Companion -> Connection -> Direct" -ForegroundColor White
+            Write-Host "  URL: wss://<gateway-host>.<tailnet>.ts.net" -ForegroundColor Green
+            Write-Host "  Token: retrieve INTERACTIVELY on that existing Gateway host with:" -ForegroundColor White
+            Write-Host "         ~/.openclaw/bin/openclaw gateway auth-token --show" -ForegroundColor Green
+            Write-Host "  If Tailscale Serve is already proxying to 127.0.0.1:18789, DO NOT re-run tailscale serve." -ForegroundColor Yellow
+            Write-Host "  Approve any device/node request on the EXISTING Gateway host." -ForegroundColor White
             Write-Host ""
         } else {
             Warn "Windows Hub is not installed. Core restore is complete."

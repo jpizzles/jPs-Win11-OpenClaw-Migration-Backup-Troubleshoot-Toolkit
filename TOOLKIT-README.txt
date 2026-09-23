@@ -1,5 +1,23 @@
-OpenClaw Backup & Migration Toolkit v1.12.2
+OpenClaw Backup & Migration Toolkit v1.12.3
 =============================================
+
+LOCAL OR EXISTING-REMOTE GATEWAY CONNECTION
+--------------------------------------------
+After a successful NEW-PC migration, the toolkit now gives both Windows Hub connection paths:
+
+A) Restored local WSL Gateway on the new PC
+   - automatic short-lived Setup code
+   - local URL: ws://127.0.0.1:18789
+
+B) Existing Gateway on another machine
+   - verify existing Tailscale Serve
+   - do not reconfigure Serve if it already proxies to 127.0.0.1:18789
+   - OpenClaw Companion -> Connection -> Direct
+   - remote URL: wss://<gateway-host>.<tailnet>.ts.net
+   - retrieve the token interactively on the existing Gateway host
+   - approve new device/node requests on the existing Gateway
+
+The restore-log folder's CONNECT-WINDOWS-HUB.txt contains both flows.
 
 AUTOMATIC WINDOWS HUB SETUP CODE
 --------------------------------

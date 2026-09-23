@@ -1,5 +1,17 @@
 # Changelog
 
+v1.12.3
+- ADDED a complete second post-migration connection path for attaching the new PC to an EXISTING remote OpenClaw Gateway instead of the newly restored local WSL Gateway.
+- `CONNECT-WINDOWS-HUB.txt` now clearly separates Option A (restored local WSL Gateway) and Option B (existing remote Gateway over Tailscale Serve).
+- Remote-Gateway instructions tell the user to check `tailscale serve status` and NOT re-run Serve when it already proxies tailnet HTTPS to `http://127.0.0.1:18789`.
+- Documents Windows Hub Direct URL format: `wss://<gateway-host>.<tailnet>.ts.net`.
+- Keeps shared-token retrieval interactive on the EXISTING Gateway host with `openclaw gateway auth-token --show`.
+- Includes device approval and separate Windows node/CUA approval on the remote Gateway host.
+- Includes shared-token rotation flow if exposed: `openclaw doctor --generate-gateway-token`, `openclaw gateway restart`, then interactive `openclaw gateway auth-token --show`.
+- Final migration console now points out both restored-local and existing-remote/Tailscale choices.
+- Expanded bundled README-RESTORE and README-MIGRATION with the same remote-Gateway guidance.
+- Retains v1.12.2 automatic local Setup-code generation and all prior restore/pairing hardening.
+
 v1.12.2
 - ADDED automatic Windows Hub Setup-code generation at the end of a successful NEW-PC migration.
 - The toolkit now runs the restored Gateway's `openclaw qr --setup-code-only --url ws://127.0.0.1:18789` command automatically and extracts the actual base64url setup payload from OpenClaw's decorated CLI output.
