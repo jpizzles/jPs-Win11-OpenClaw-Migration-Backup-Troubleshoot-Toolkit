@@ -1,0 +1,25 @@
+name: Refresh v1.10.5 Release Notes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/refresh-v1.10.5-release-notes.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refresh GitHub release notes and verify asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit v1.10.5 --notes-file RELEASE_NOTES_v1.10.5.md
+          gh release view v1.10.5 --json tagName,name,url,assets,body
