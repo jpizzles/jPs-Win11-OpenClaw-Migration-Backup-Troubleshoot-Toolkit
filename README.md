@@ -11,12 +11,12 @@
   <img alt="WSL2" src="https://img.shields.io/badge/WSL-2-FCC624?logo=linux&logoColor=black">
   <img alt="OpenClaw" src="https://img.shields.io/badge/OpenClaw-Backup%20%7C%20Migration%20%7C%20Repair-111827">
   <img alt="Hatch IQ" src="https://img.shields.io/badge/Created%20by-Hatch%20IQ-7C3AED">
-  <img alt="Release" src="https://img.shields.io/badge/release-v1.10.4-22C55E">
+  <img alt="Release" src="https://img.shields.io/badge/release-v1.10.5-22C55E">
 </p>
 
 > Created by **Hatch IQ** as an independent community utility for OpenClaw backup, migration, restore, recovery, reset and debugging workflows.
 
-## Current release — v1.10.4
+## Current release — v1.10.5
 
 Download the complete toolkit:
 
@@ -91,21 +91,22 @@ Documents\OpenClaw-Restore-Logs\<run>\
 
 Complete the listed prerequisite and run `CONTINUE-RESTORE.cmd`; the prerequisite checks are repeated before restore continues.
 
-## v1.10.4 — WSL post-install freeze fix
+## v1.10.5 — WSL canonical runtime detection
 
-The reported failure had already completed the WSL OpenClaw install successfully, then appeared to freeze during a non-essential shell-profile/symlink mutation.
-
-v1.10.4 removes that step entirely. After installation it directly verifies:
+v1.10.5 fixes the native WSL OpenClaw detector that could throw a Bash syntax error around `/mnt/*` before the installer ran. The toolkit now prefers the canonical Linux runtime files directly:
 
 ```text
 ~/.openclaw/bin/openclaw
 ~/.openclaw/tools/node/bin/node
 ```
 
-Both canonical binaries are executed with `--version` before restore is allowed to proceed. The installer also gets a 15-minute watchdog when Linux `timeout` is available, so a genuine installer hang fails safely instead of waiting forever.
+It rejects Windows-mounted `.cmd`/`.exe` launchers with simple path checks rather than the previous fragile Bash `case` expression.
+
+The v1.10.4 post-install reliability fix is retained: there is no non-essential `~/.profile` mutation or `~/.local/bin/openclaw` symlink step after installation. Both canonical binaries are verified directly, and the WSL OpenClaw installer has a 15-minute watchdog when Linux `timeout` is available.
 
 ## Recent reliability fixes
 
+- v1.10.4 removes the post-install profile/symlink step that could appear to freeze after OpenClaw had already installed successfully.
 - v1.10.3 isolates all toolkit WSL commands from inherited Windows PATH entries so `/mnt/c/.../npm/openclaw` cannot replace the native Linux CLI.
 - v1.10.2 downloads the Windows OpenClaw installer to a real `.ps1` file and executes it with `powershell.exe -File`, avoiding PowerShell 5.1 byte-array coercion failures.
 - v1.10.1 fixes PowerShell parsing of Linux `/dev/null` redirection.
@@ -157,7 +158,7 @@ See [`SECURITY.md`](SECURITY.md).
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md)
-- [`RELEASE_NOTES_v1.10.4.md`](RELEASE_NOTES_v1.10.4.md)
+- [`RELEASE_NOTES_v1.10.5.md`](RELEASE_NOTES_v1.10.5.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/NEW-PC-MIGRATION.md`](docs/NEW-PC-MIGRATION.md)
 - [`docs/RESET-REPAIR.md`](docs/RESET-REPAIR.md)
