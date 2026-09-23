@@ -4,8 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "dist/OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip"
-      - "RELEASE_NOTES_v1.12.2.md"
+      - ".release/v1.12.2/**"
       - ".github/workflows/publish-v1.12.2.yml"
   workflow_dispatch:
 
@@ -21,15 +20,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify v1.12.2 distribution
+      - name: Rebuild and verify v1.12.2 distribution
         shell: bash
         run: |
           set -euo pipefail
-          ZIP="dist/OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip"
+          ZIP="/tmp/OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip"
           EXPECTED="be8c1999a1cd1777eca55b8cdbc2f7362f6246851eabdc479fa66eca7cb3f955"
-          test -f "$ZIP"
+
+          cat .release/v1.12.2/tool.zip.b64.* | tr -d '\r\n' | base64 --decode > "$ZIP"
           echo "$EXPECTED  $ZIP" | sha256sum -c -
+          test "$(stat -c%s "$ZIP")" -eq 68089
           unzip -t "$ZIP"
+
           rm -rf /tmp/openclaw-v1122
           mkdir -p /tmp/openclaw-v1122
           unzip -q "$ZIP" -d /tmp/openclaw-v1122
@@ -38,23 +40,26 @@ jobs:
           test -f "$SRC/OpenClaw-Backup-Migrate.cmd"
           grep -F '$Script:ToolVersion = "1.12.2"' "$SRC/OpenClaw-Backup-Migrate.ps1"
 
-      - name: Materialize verified v1.12.2 source on main
-        shell: bash
-        run: |
-          set -euo pipefail
-          SRC="/tmp/openclaw-v1122/OpenClaw_Backup_Migration_Toolkit"
+          mkdir -p dist
+          cp "$ZIP" dist/OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip
           cp "$SRC/OpenClaw-Backup-Migrate.ps1" ./OpenClaw-Backup-Migrate.ps1
           cp "$SRC/OpenClaw-Backup-Migrate.cmd" ./OpenClaw-Backup-Migrate.cmd
           cp "$SRC/README.txt" ./TOOLKIT-README.txt
           if test -f "$SRC/RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd"; then cp "$SRC/RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd" ./RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd; fi
           if test -f "$SRC/CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd"; then cp "$SRC/CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd" ./CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd; fi
+
           printf '# Changelog\n\n' > CHANGELOG.md
           cat "$SRC/CHANGELOG.txt" >> CHANGELOG.md
           printf 'Hatch IQ OpenClaw Backup, Migration & Recovery Toolkit\nLatest: v1.12.2\nSHA-256: be8c1999a1cd1777eca55b8cdbc2f7362f6246851eabdc479fa66eca7cb3f955\n' > LATEST.txt
           printf 'be8c1999a1cd1777eca55b8cdbc2f7362f6246851eabdc479fa66eca7cb3f955  OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip\n' > SHA256SUMS.txt
+
+      - name: Commit verified release files
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add OpenClaw-Backup-Migrate.ps1 OpenClaw-Backup-Migrate.cmd TOOLKIT-README.txt CHANGELOG.md LATEST.txt SHA256SUMS.txt
+          git add OpenClaw-Backup-Migrate.ps1 OpenClaw-Backup-Migrate.cmd TOOLKIT-README.txt CHANGELOG.md LATEST.txt SHA256SUMS.txt dist/OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip
           git add RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "Materialize verified Hatch IQ OpenClaw Toolkit v1.12.2"
