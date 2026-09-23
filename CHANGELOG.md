@@ -1,5 +1,10 @@
 # Changelog
 
+v1.10.5
+- Fix WSL OpenClaw detector syntax error.
+- Prefer canonical Linux OpenClaw and private Node binaries.
+- Retain post-install freeze fix and watchdog.
+
 ## v1.10.4
 
 - Fixed apparent freeze immediately after a successful WSL OpenClaw installation.

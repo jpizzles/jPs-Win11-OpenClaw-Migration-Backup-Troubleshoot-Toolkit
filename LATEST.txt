@@ -1,3 +1,3 @@
-v1.10.4
-dist/OpenClaw_Backup_Migration_Toolkit_v1.10.4.zip
-SHA256: ee0d114ad9417dadcf248e89a4d8b677c00304b2638edf4bd47a02f40af5116a
+Hatch IQ OpenClaw Backup, Migration & Recovery Toolkit
+Latest: v1.10.5
+SHA-256: cd23ebc47b42d5c0fc48e5d5b18ec98c2e4914d26ee4909dd6f36ea1ad81afcc
