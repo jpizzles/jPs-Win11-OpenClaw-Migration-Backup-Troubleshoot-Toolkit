@@ -1,5 +1,48 @@
-OpenClaw Backup & Migration Toolkit v1.10.4
+OpenClaw Backup & Migration Toolkit v1.10.6
 =============================================
+
+FUNDAMENTAL WSL SCRIPT-TRANSPORT FIX
+------------------------------------
+The latest failure was not another failed OpenClaw installation.
+
+Immediately before the failure, the toolkit successfully executed the canonical WSL
+OpenClaw and private Node binaries. The later prerequisite script then printed empty
+OPENCLAW_PATH/NODE_PATH variables.
+
+v1.10.6 fixes the transport itself. Every toolkit WSL command is now written to a temporary
+UTF-8/no-BOM, LF-only Bash file and executed with:
+
+    wsl.exe -d <distro> -- bash --noprofile --norc <script-file>
+
+The Bash source is no longer embedded in a Windows native command-line argument, so shell
+variables, quotes, command substitution, pipes, and multiline syntax are preserved.
+
+The same transport is used for root-level WSL setup, and a transport self-test runs before
+the OpenClaw prerequisite phase.
+
+The generated fallback guide also preserves Linux `$HOME` literally.
+
+WSL OPENCLAW DETECTION FIX
+--------------------------
+The v1.10.3 log exposed a second issue before the successful OpenClaw install:
+
+    bash: -c: line 5: syntax error near unexpected token `/mnt/*'
+
+The detector used a Bash `case` expression with multiple glob alternatives. That expression
+proved fragile through the Windows PowerShell -> wsl.exe -> bash -lc command transport.
+
+v1.10.5 removes that syntax completely.
+
+The toolkit now checks the canonical Linux installation first:
+
+    ~/.openclaw/bin/openclaw
+    ~/.openclaw/tools/node/bin/node
+
+Only if those files do not exist does it consult PATH. Any result under /mnt/ or ending in
+.cmd/.exe is rejected with simple grep checks.
+
+v1.10.5 also includes the v1.10.4 fix that removed the unnecessary post-install profile/symlink
+step that could appear to freeze after OpenClaw had already installed successfully.
 
 WSL OPENCLAW POST-INSTALL FREEZE FIX
 ------------------------------------
@@ -423,8 +466,3 @@ v1.1.0 fix
 - Uses `openclaw gateway stop --force` when stopping the WSL Gateway from the non-interactive backup process.
 - Falls back to `systemctl --user stop` if OpenClaw service stop itself fails.
 - Explicitly checks that Payload contains a non-empty verified .tar.gz before declaring success.
-
-v1.10.5 NOTE
-------------
-WSL OpenClaw detection now prefers the canonical Linux OpenClaw and private Node binaries directly.
-The fragile Bash case detector was removed. The post-install profile/symlink step remains removed.

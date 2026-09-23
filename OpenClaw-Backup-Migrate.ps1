@@ -32,7 +32,7 @@ Set-StrictMode -Version 2
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$Script:ToolVersion = "1.10.5"
+$Script:ToolVersion = "1.10.6"
 $Script:CurrentLog = $null
 
 $Script:SelectedDistro = $null
@@ -155,30 +155,78 @@ function Invoke-Native {
     return [pscustomobject]@{ ExitCode=$code; Output=(($output | ForEach-Object { $_.ToString() }) -join "`n") }
 }
 
-function Invoke-Wsl {
+function Convert-TempWindowsPathToWsl([string]$WindowsPath) {
+    $full = [System.IO.Path]::GetFullPath($WindowsPath)
+    if ($full -match '^([A-Za-z]):\\(.*)$') {
+        $drive = $matches[1].ToLowerInvariant()
+        $rest = $matches[2] -replace '\\','/'
+        return "/mnt/$drive/$rest"
+    }
+    Fail "Temporary WSL script path is not on a local drive: $full"
+}
+
+function Invoke-WslScriptTransport {
     param(
         [Parameter(Mandatory=$true)][string]$Command,
-        [switch]$AllowFailure
+        [switch]$AsRoot,
+        [switch]$AllowFailure,
+        [switch]$Quiet
     )
 
     if (-not $Script:SelectedDistro) { Select-WslDistro }
 
-    # WSL normally appends the Windows PATH into Linux. Once the native Windows
-    # OpenClaw installer adds %APPDATA%\npm, a plain `openclaw` inside WSL can
-    # accidentally resolve to /mnt/c/.../npm/openclaw instead of the native
-    # Linux CLI. That Windows shim then tries to execute Windows node from WSL
-    # and can fail with "exec: node: Permission denied".
-    #
-    # Every toolkit WSL command therefore runs with an explicit Linux-only PATH.
-    # The local-prefix installer puts:
-    #   OpenClaw CLI: $HOME/.openclaw/bin
-    #   private Node: $HOME/.openclaw/tools/node/bin
-    $linuxPathPrelude = 'export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; hash -r; '
-    $wrappedCommand = $linuxPathPrelude + $Command
+    $tempRoot = Join-Path $env:TEMP "HatchIQ-OpenClaw-WslScripts"
+    Ensure-Directory $tempRoot
+    $scriptWin = Join-Path $tempRoot ("wsl-" + [guid]::NewGuid().ToString("N") + ".sh")
 
-    $args = @("-d", $Script:SelectedDistro, "--", "bash", "-lc", $wrappedCommand)
-    $r = Invoke-Native -FilePath "wsl.exe" -Arguments $args -AllowFailure:$AllowFailure
-    return $r
+    if ($AsRoot) {
+        $prelude = @'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+'@
+    } else {
+        $prelude = @'
+export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+hash -r
+'@
+    }
+
+    $scriptText = "#!/usr/bin/env bash`n" + $prelude.TrimEnd() + "`n" + $Command.TrimEnd() + "`n"
+    $scriptText = $scriptText.Replace("`r`n","`n").Replace("`r","`n")
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($scriptWin, $scriptText, $utf8NoBom)
+    $scriptWsl = Convert-TempWindowsPathToWsl $scriptWin
+
+    $args = @("-d", $Script:SelectedDistro)
+    if ($AsRoot) { $args += @("-u","root") }
+    $args += @("--","bash","--noprofile","--norc",$scriptWsl)
+
+    try {
+        if (-not $Quiet) {
+            Info ("WSL script transport: {0} ({1} chars)" -f $(if ($AsRoot) { "root" } else { "user" }), $Command.Length)
+        }
+        return Invoke-Native -FilePath "wsl.exe" -Arguments $args -AllowFailure:$AllowFailure -Quiet:$Quiet
+    } finally {
+        try { Remove-Item -LiteralPath $scriptWin -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+function Invoke-Wsl {
+    param(
+        [Parameter(Mandatory=$true)][string]$Command,
+        [switch]$AllowFailure,
+        [switch]$Quiet
+    )
+    return Invoke-WslScriptTransport -Command $Command -AllowFailure:$AllowFailure -Quiet:$Quiet
+}
+
+function Invoke-WslRoot {
+    param(
+        [Parameter(Mandatory=$true)][string]$Command,
+        [switch]$AllowFailure,
+        [switch]$Quiet
+    )
+    return Invoke-WslScriptTransport -Command $Command -AsRoot -AllowFailure:$AllowFailure -Quiet:$Quiet
 }
 
 function Convert-ToWslPath([string]$WindowsPath) {
@@ -694,7 +742,7 @@ fi
             -Problem "The WSL OpenClaw installer exceeded the 15-minute safety timeout." `
             -ManualSteps @(
                 "Open the selected WSL distro.",
-                "Run: export PATH=`"$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`"",
+                'Run: export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
                 "Run: openclaw --version",
                 "If OpenClaw is already installed, exit WSL and run CONTINUE-RESTORE.cmd.",
                 "Otherwise run: curl -fsSL https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest",
@@ -736,10 +784,10 @@ printf 'NODE_FILE=%s\n' "$HOME/.openclaw/tools/node/bin/node"
         -Problem "Automatic OpenClaw installation inside WSL failed or could not be verified." `
         -ManualSteps @(
             "Open the selected WSL distro.",
-            "Run: export PATH=`"$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`"",
+            'Run: export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
             "Run: curl -fsSL https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest",
-            "Verify: $HOME/.openclaw/bin/openclaw --version",
-            "Verify: $HOME/.openclaw/tools/node/bin/node --version",
+            'Verify: $HOME/.openclaw/bin/openclaw --version',
+            'Verify: $HOME/.openclaw/tools/node/bin/node --version',
             "Exit WSL and run CONTINUE-RESTORE.cmd."
         )
     Fail "OpenClaw WSL installation requires manual completion."
@@ -1761,9 +1809,8 @@ default=openclaw
 EOF
 '@
 
-    $r = Invoke-Native -FilePath $wslExe -Arguments @(
-        "-d",$DistroName,"-u","root","--","bash","-lc",$initScript
-    ) -AllowFailure
+    $Script:SelectedDistro = $DistroName
+    $r = Invoke-WslRoot -Command $initScript -AllowFailure
 
     if ($r.ExitCode -ne 0) {
         Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
@@ -1851,9 +1898,7 @@ else
 fi
 '@
 
-    $cfgResult = Invoke-Native -FilePath $wslExe -Arguments @(
-        "-d",$Script:SelectedDistro,"-u","root","--","bash","-lc",$cfg
-    ) -AllowFailure
+    $cfgResult = Invoke-WslRoot -Command $cfg -AllowFailure
 
     if ($cfgResult.ExitCode -ne 0) {
         Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
@@ -1905,15 +1950,10 @@ function Ensure-LinuxRestorePrerequisites {
     Warn "One or more Linux utilities are missing. Attempting automatic package installation."
     $wslExe = "$env:WINDIR\System32\wsl.exe"
 
-    $hasApt = Invoke-Native -FilePath $wslExe -Arguments @(
-        "-d",$Script:SelectedDistro,"-u","root","--","bash","-lc","command -v apt-get >/dev/null 2>&1"
-    ) -AllowFailure -Quiet
+    $hasApt = Invoke-WslRoot -Command 'command -v apt-get >/dev/null 2>&1' -AllowFailure -Quiet
 
     if ($hasApt.ExitCode -eq 0) {
-        $install = Invoke-Native -FilePath $wslExe -Arguments @(
-            "-d",$Script:SelectedDistro,"-u","root","--","bash","-lc",
-            "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 tar gzip coreutils dbus-x11 sudo passwd"
-        ) -AllowFailure
+        $install = Invoke-WslRoot -Command 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 tar gzip coreutils dbus-x11 sudo passwd' -AllowFailure
 
         if ($install.ExitCode -eq 0) {
             $linuxPrereqVerifyCmd = 'for c in bash curl python3 tar gzip sha256sum systemctl; do command -v "$c" >/dev/null 2>&1 || exit 1; done'
@@ -2009,6 +2049,31 @@ function Ensure-WslForRestore {
         Fail "WSL distro requires manual first-run setup."
     }
 
+    Step "Checking WSL script transport integrity"
+    $transportProbe = @'
+set -e
+alpha="A"
+beta="$(printf 'B')"
+gamma='C D'
+printf 'WSL_SCRIPT_TRANSPORT_OK=%s:%s:%s\n' "$alpha" "$beta" "$gamma"
+[ "$alpha" = "A" ]
+[ "$beta" = "B" ]
+[ "$gamma" = "C D" ]
+'@
+    $transportResult = Invoke-Wsl $transportProbe -AllowFailure
+    if ($transportResult.ExitCode -ne 0 -or
+        $transportResult.Output -notmatch 'WSL_SCRIPT_TRANSPORT_OK=A:B:C D') {
+        Write-RestoreFallbackGuide -SupportFolder $SupportFolder -PackageFolder $PackageFolder `
+            -Problem "The Windows-to-WSL script transport self-test failed. Restore was stopped before OpenClaw state activation." `
+            -ManualSteps @(
+                "Run: wsl -d $($Script:SelectedDistro) -- bash --noprofile --norc",
+                "At the Linux prompt run: printf 'WSL_OK\n'",
+                "Exit WSL and run CONTINUE-RESTORE.cmd."
+            )
+        Fail "WSL script transport integrity check failed."
+    }
+    Pass "WSL multiline variables/quoting/command substitution transport is intact."
+
     Ensure-WslSystemd -SupportFolder $SupportFolder -PackageFolder $PackageFolder
     Ensure-LinuxRestorePrerequisites -SupportFolder $SupportFolder -PackageFolder $PackageFolder
 }
@@ -2039,33 +2104,22 @@ say "Restore preflight"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 test -f "$ARCHIVE" || die "Archive not found: $ARCHIVE"
 
-if [[ -x "$HOME/.openclaw/bin/openclaw" ]]; then
-  resolved_openclaw="$HOME/.openclaw/bin/openclaw"
-else
-  resolved_openclaw="$(command -v openclaw 2>/dev/null || true)"
-fi
+resolved_openclaw="$HOME/.openclaw/bin/openclaw"
+resolved_node="$HOME/.openclaw/tools/node/bin/node"
 
-if [[ -n "$resolved_openclaw" ]] && printf '%s\n' "$resolved_openclaw" | grep -q '^/mnt/'; then
-  warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
-  resolved_openclaw=""
-fi
-if [[ -n "$resolved_openclaw" ]] && printf '%s\n' "$resolved_openclaw" | grep -Eiq '\.(cmd|exe)$'; then
-  warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
-  resolved_openclaw=""
-fi
-
-if [[ -z "$resolved_openclaw" ]]; then
+if [[ ! -x "$resolved_openclaw" || ! -x "$resolved_node" ]]; then
   say "Installing latest stable OpenClaw"
   curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest
   hash -r
-  resolved_openclaw="$(command -v openclaw 2>/dev/null || true)"
 fi
 
-[[ -n "$resolved_openclaw" && "$resolved_openclaw" != /mnt/* ]] || die "Native Linux OpenClaw is still not available"
-printf '[INFO] Native WSL OpenClaw: %s
-' "$resolved_openclaw"
-openclaw --version
-pass "Native WSL OpenClaw CLI available"
+[[ -x "$resolved_openclaw" ]] || die "Canonical Linux OpenClaw is still not available: $resolved_openclaw"
+[[ -x "$resolved_node" ]] || die "Canonical Linux Node runtime is still not available: $resolved_node"
+printf '[INFO] Native WSL OpenClaw: %s\n' "$resolved_openclaw"
+printf '[INFO] Native WSL Node: %s\n' "$resolved_node"
+"$resolved_openclaw" --version
+"$resolved_node" --version
+pass "Native WSL OpenClaw CLI and Node runtime available"
 
 say "Verifying archive before touching live state"
 openclaw backup verify "$ARCHIVE" --json
@@ -2193,9 +2247,12 @@ say "Reinstalling/refreshing latest stable OpenClaw runtime after state activati
 curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install-cli.sh | bash -s -- --runtime-only --version latest
 export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 hash -r
-resolved_openclaw="$(command -v openclaw 2>/dev/null || true)"
-[[ -n "$resolved_openclaw" && "$resolved_openclaw" != /mnt/* ]] || die "Native Linux OpenClaw unavailable after runtime refresh"
-openclaw --version
+resolved_openclaw="$HOME/.openclaw/bin/openclaw"
+resolved_node="$HOME/.openclaw/tools/node/bin/node"
+[[ -x "$resolved_openclaw" ]] || die "Canonical Linux OpenClaw unavailable after runtime refresh"
+[[ -x "$resolved_node" ]] || die "Canonical Linux Node unavailable after runtime refresh"
+"$resolved_openclaw" --version
+"$resolved_node" --version
 
 say "Running database/config preflight and Doctor"
 openclaw database preflight || warn "Database preflight reported a problem; inspect before relying on this migration."
@@ -2264,7 +2321,7 @@ function Refresh-WindowsOpenClawPath {
         if ([string]::IsNullOrWhiteSpace($dir)) { continue }
         try {
             $full = [Environment]::ExpandEnvironmentVariables($dir.Trim())
-            if ((Test-Path -LiteralPath $full -PathType Container) -and (-not $existing.Contains($full))) {
+            if ([System.IO.Directory]::Exists($full) -and (-not $existing.Contains($full))) {
                 $env:PATH = "$full;$env:PATH"
                 [void]$existing.Add($full)
             }
@@ -2280,7 +2337,7 @@ function Find-WindowsOpenClawShim {
     )
 
     foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+        if ([System.IO.File]::Exists($candidate)) {
             return $candidate
         }
     }
@@ -2566,28 +2623,15 @@ function Ensure-RestorePrerequisites {
 
     $wslVerifyCmd = @'
 set -e
-if [ -x "$HOME/.openclaw/bin/openclaw" ]; then
-  oc="$HOME/.openclaw/bin/openclaw"
-else
-  oc="$(command -v openclaw 2>/dev/null || true)"
-fi
 
-if [ -x "$HOME/.openclaw/tools/node/bin/node" ]; then
-  nodebin="$HOME/.openclaw/tools/node/bin/node"
-else
-  nodebin="$(command -v node 2>/dev/null || true)"
-fi
+oc="$HOME/.openclaw/bin/openclaw"
+nodebin="$HOME/.openclaw/tools/node/bin/node"
+
+test -x "$oc"
+test -x "$nodebin"
 
 printf 'OPENCLAW_PATH=%s\n' "$oc"
 printf 'NODE_PATH=%s\n' "$nodebin"
-
-[ -n "$oc" ] || exit 91
-[ -n "$nodebin" ] || exit 92
-
-printf '%s\n' "$oc" | grep -q '^/mnt/' && exit 91
-printf '%s\n' "$nodebin" | grep -q '^/mnt/' && exit 92
-printf '%s\n' "$oc" | grep -Eiq '\.(cmd|exe)$' && exit 91
-printf '%s\n' "$nodebin" | grep -Eiq '\.(cmd|exe)$' && exit 92
 
 "$oc" --version
 "$nodebin" --version
@@ -2607,7 +2651,7 @@ ps -p 1 -o comm=
             -Problem "WSL prerequisite verification failed after installation." `
             -ManualSteps @(
                 "Open the selected WSL distro.",
-                "Run: export PATH=`"$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`"",
+                'Run: export PATH="$HOME/.openclaw/bin:$HOME/.openclaw/tools/node/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
                 "Run: command -v openclaw ; openclaw --version",
                 "Run: command -v node ; node --version",
                 "Run: python3 --version",
