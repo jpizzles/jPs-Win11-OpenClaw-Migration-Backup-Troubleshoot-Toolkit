@@ -1,0 +1,225 @@
+name: Publish v1.10.5
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/publish-v1.10.5.yml"
+      - "RELEASE_NOTES_v1.10.5.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate v1.10.4 base package
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="dist/OpenClaw_Backup_Migration_Toolkit_v1.10.4.zip"
+          test -f "$BASE"
+          unzip -t "$BASE"
+          rm -rf /tmp/base-toolkit
+          mkdir -p /tmp/base-toolkit
+          unzip -q "$BASE" -d /tmp/base-toolkit
+          SRC="/tmp/base-toolkit/OpenClaw_Backup_Migration_Toolkit"
+          test -f "$SRC/OpenClaw-Backup-Migrate.ps1"
+          grep -F '$Script:ToolVersion = "1.10.4"' "$SRC/OpenClaw-Backup-Migrate.ps1"
+          grep -F 'Verifying native WSL OpenClaw immediately after install' "$SRC/OpenClaw-Backup-Migrate.ps1"
+
+      - name: Apply v1.10.5 WSL detector fix
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          p = Path('/tmp/base-toolkit/OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.ps1')
+          s = p.read_text(encoding='utf-8-sig')
+          s = s.replace('$Script:ToolVersion = "1.10.4"', '$Script:ToolVersion = "1.10.5"')
+
+          new_test = r'''function Test-OpenClawWsl {
+              # Prefer the canonical rootless Linux installation directly.
+              $cmd = @'
+          set -e
+          if [ -x "$HOME/.openclaw/bin/openclaw" ]; then
+            resolved="$HOME/.openclaw/bin/openclaw"
+          else
+            resolved="$(command -v openclaw 2>/dev/null || true)"
+          fi
+          if [ -z "$resolved" ]; then exit 127; fi
+          printf 'OPENCLAW_WSL_PATH=%s\n' "$resolved"
+          printf '%s\n' "$resolved" | grep -q '^/mnt/' && exit 126
+          printf '%s\n' "$resolved" | grep -Eiq '\.(cmd|exe)$' && exit 126
+          "$resolved" --version
+          '@
+              $r = Invoke-Wsl $cmd -AllowFailure
+              if ($r.ExitCode -eq 0 -and $r.Output -match 'OPENCLAW_WSL_PATH=') {
+                  $pathLine = ($r.Output -split "`r?`n" | Where-Object { $_ -like 'OPENCLAW_WSL_PATH=*' } | Select-Object -Last 1)
+                  if ($pathLine) { Info $pathLine }
+                  $versionLine = ($r.Output -split "`r?`n" | Where-Object { $_ -match '^OpenClaw ' } | Select-Object -Last 1)
+                  Pass "OpenClaw is installed natively in WSL: $versionLine"
+                  return $true
+              }
+              if ($r.ExitCode -eq 126) { Warn "A Windows-mounted OpenClaw launcher was visible inside WSL and was rejected." }
+              else { Warn "Native Linux OpenClaw is not installed in WSL." }
+              return $false
+          }
+
+          function Install-OpenClawWslIfMissing'''
+
+          s, n = re.subn(r'function Test-OpenClawWsl \{.*?\n\}\n\nfunction Install-OpenClawWslIfMissing', new_test, s, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('Could not replace Test-OpenClawWsl')
+
+          old = '''oc="$(command -v openclaw 2>/dev/null || true)"
+          nodebin="$(command -v node 2>/dev/null || true)"
+
+          printf 'OPENCLAW_PATH=%s\\n' "$oc"
+          printf 'NODE_PATH=%s\\n' "$nodebin"
+
+          case "$oc" in
+            ""|/mnt/*|*.cmd|*.exe) exit 91 ;;
+          esac
+          case "$nodebin" in
+            ""|/mnt/*|*.cmd|*.exe) exit 92 ;;
+          esac
+
+          openclaw --version
+          node --version'''
+          new = '''if [ -x "$HOME/.openclaw/bin/openclaw" ]; then
+            oc="$HOME/.openclaw/bin/openclaw"
+          else
+            oc="$(command -v openclaw 2>/dev/null || true)"
+          fi
+          if [ -x "$HOME/.openclaw/tools/node/bin/node" ]; then
+            nodebin="$HOME/.openclaw/tools/node/bin/node"
+          else
+            nodebin="$(command -v node 2>/dev/null || true)"
+          fi
+          printf 'OPENCLAW_PATH=%s\\n' "$oc"
+          printf 'NODE_PATH=%s\\n' "$nodebin"
+          [ -n "$oc" ] || exit 91
+          [ -n "$nodebin" ] || exit 92
+          printf '%s\\n' "$oc" | grep -q '^/mnt/' && exit 91
+          printf '%s\\n' "$nodebin" | grep -q '^/mnt/' && exit 92
+          printf '%s\\n' "$oc" | grep -Eiq '\\.(cmd|exe)$' && exit 91
+          printf '%s\\n' "$nodebin" | grep -Eiq '\\.(cmd|exe)$' && exit 92
+          "$oc" --version
+          "$nodebin" --version'''
+          if old not in s:
+              raise SystemExit('Could not replace final prerequisite verification')
+          s = s.replace(old, new, 1)
+
+          old2 = '''resolved_openclaw="$(command -v openclaw 2>/dev/null || true)"
+          case "$resolved_openclaw" in
+            /mnt/*|*.cmd|*.exe)
+              warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
+              resolved_openclaw=""
+              ;;
+          esac
+
+          if [[ -z "$resolved_openclaw" ]]; then'''
+          new2 = '''if [[ -x "$HOME/.openclaw/bin/openclaw" ]]; then
+            resolved_openclaw="$HOME/.openclaw/bin/openclaw"
+          else
+            resolved_openclaw="$(command -v openclaw 2>/dev/null || true)"
+          fi
+          if [[ -n "$resolved_openclaw" ]] && printf '%s\\n' "$resolved_openclaw" | grep -q '^/mnt/'; then
+            warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
+            resolved_openclaw=""
+          fi
+          if [[ -n "$resolved_openclaw" ]] && printf '%s\\n' "$resolved_openclaw" | grep -Eiq '\\.(cmd|exe)$'; then
+            warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
+            resolved_openclaw=""
+          fi
+
+          if [[ -z "$resolved_openclaw" ]]; then'''
+          if old2 not in s:
+              raise SystemExit('Could not replace staged restore detector')
+          s = s.replace(old2, new2, 1)
+
+          if '/mnt/*|*.cmd|*.exe)' in s:
+              raise SystemExit('Fragile case detector still present')
+          if "profile_line='export PATH=" in s:
+              raise SystemExit('Old post-install profile mutation unexpectedly present')
+          if '$Script:ToolVersion = "1.10.5"' not in s:
+              raise SystemExit('Version patch failed')
+          p.write_text(s, encoding='utf-8-sig')
+
+      - name: Build and verify v1.10.5 package
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="/tmp/base-toolkit/OpenClaw_Backup_Migration_Toolkit"
+          ZIP="$GITHUB_WORKSPACE/dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip"
+          rm -f "$ZIP"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          (cd /tmp/base-toolkit && zip -9 -r "$ZIP" OpenClaw_Backup_Migration_Toolkit >/dev/null)
+          unzip -t "$ZIP"
+          unzip -p "$ZIP" OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.ps1 | grep -F '$Script:ToolVersion = "1.10.5"'
+          unzip -p "$ZIP" OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.ps1 | grep -F 'timeout --signal=TERM --kill-after=20s 15m'
+          if unzip -p "$ZIP" OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.ps1 | grep -F '/mnt/*|*.cmd|*.exe)'; then exit 1; fi
+          cp "$SRC/OpenClaw-Backup-Migrate.ps1" "$GITHUB_WORKSPACE/OpenClaw-Backup-Migrate.ps1"
+          cp "$SRC/OpenClaw-Backup-Migrate.cmd" "$GITHUB_WORKSPACE/OpenClaw-Backup-Migrate.cmd"
+          cp "$SRC/README.txt" "$GITHUB_WORKSPACE/TOOLKIT-README.txt"
+          HASH=$(sha256sum "$ZIP" | awk '{print $1}')
+          printf '%s  OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip\n' "$HASH" > SHA256SUMS.txt
+          printf 'Hatch IQ OpenClaw Backup, Migration & Recovery Toolkit\nLatest: v1.10.5\nSHA-256: %s\n' "$HASH" > LATEST.txt
+          echo "Release SHA-256: $HASH"
+
+      - name: Update public README and changelog
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          readme = Path('README.md')
+          s = readme.read_text(encoding='utf-8')
+          s = re.sub(r'Current packaged release: \*\*v[0-9.]+\*\*', 'Current packaged release: **v1.10.5**', s)
+          s = re.sub(r'OpenClaw_Backup_Migration_Toolkit_v[0-9.]+\.zip', 'OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip', s)
+          s = s.replace(' Add a license before accepting third-party redistribution or contributions.', '')
+          note = '''\n### WSL canonical runtime detection\n\nv1.10.5 removes the fragile Bash `case` detector that could throw a syntax error around `/mnt/*`. It now prefers the canonical Linux OpenClaw and private Node binaries and retains the v1.10.4 post-install freeze fix.\n\n'''
+          if '### WSL canonical runtime detection' not in s:
+              marker = '### WSL installer post-install reliability\n'
+              s = s.replace(marker, note + marker, 1) if marker in s else s
+          readme.write_text(s, encoding='utf-8')
+
+          c = Path('CHANGELOG.md')
+          old = c.read_text(encoding='utf-8') if c.exists() else '# Changelog\n\n'
+          entry = '''# Changelog\n\nv1.10.5\n- Fix native WSL OpenClaw detector syntax error around `/mnt/*`.\n- Prefer canonical Linux OpenClaw and private Node paths directly.\n- Retain v1.10.4 post-install freeze fix and installer watchdog.\n- Reject Windows-mounted WSL launchers using simple path checks.\n\n'''
+          if 'v1.10.5' not in old:
+              old = re.sub(r'^# Changelog\s*', '', old)
+              c.write_text(entry + old, encoding='utf-8')
+
+      - name: Commit verified v1.10.5 files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add OpenClaw-Backup-Migrate.ps1 OpenClaw-Backup-Migrate.cmd TOOLKIT-README.txt README.md CHANGELOG.md RELEASE_NOTES_v1.10.5.md LATEST.txt SHA256SUMS.txt dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish Hatch IQ OpenClaw Toolkit v1.10.5"
+            git push origin HEAD:main
+          fi
+
+      - name: Create or refresh GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip"
+          if gh release view v1.10.5 >/dev/null 2>&1; then
+            gh release upload v1.10.5 "$ZIP" --clobber
+          else
+            gh release create v1.10.5 "$ZIP" --title "Hatch IQ OpenClaw Toolkit v1.10.5" --notes-file RELEASE_NOTES_v1.10.5.md --target main
+          fi
+          gh release view v1.10.5 --json tagName,name,url,assets
