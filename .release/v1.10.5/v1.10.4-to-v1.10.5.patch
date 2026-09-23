@@ -1,0 +1,139 @@
+--- a/OpenClaw-Backup-Migrate.ps1
++++ b/OpenClaw-Backup-Migrate.ps1
+@@ -32,7 +32,7 @@
+ $ErrorActionPreference = "Stop"
+ $ProgressPreference = "SilentlyContinue"
+ 
+-$Script:ToolVersion = "1.10.4"
++$Script:ToolVersion = "1.10.5"
+ $Script:CurrentLog = $null
+ 
+ $Script:SelectedDistro = $null
+@@ -615,26 +615,30 @@
+ }
+ 
+ function Test-OpenClawWsl {
++    # Prefer the canonical rootless Linux installation directly.
++    # Do NOT depend on `command -v openclaw` first because WSL can inherit a
++    # Windows npm shim via /mnt/c even when the native Linux CLI is healthy.
+     $cmd = @'
+ set -e
+-resolved="$(command -v openclaw 2>/dev/null || true)"
+-
+-case "$resolved" in
+-  /mnt/*|*.cmd|*.exe)
+-    echo "WINDOWS_SHIM_REJECTED:$resolved"
+-    exit 126
+-    ;;
+-esac
+-
+-if [ -n "$resolved" ]; then
+-  printf 'OPENCLAW_WSL_PATH=%s\n' "$resolved"
+-  openclaw --version
+-elif [ -x "$HOME/.openclaw/bin/openclaw" ]; then
+-  printf 'OPENCLAW_WSL_PATH=%s\n' "$HOME/.openclaw/bin/openclaw"
+-  "$HOME/.openclaw/bin/openclaw" --version
++
++if [ -x "$HOME/.openclaw/bin/openclaw" ]; then
++  resolved="$HOME/.openclaw/bin/openclaw"
+ else
++  resolved="$(command -v openclaw 2>/dev/null || true)"
++fi
++
++if [ -z "$resolved" ]; then
+   exit 127
+ fi
++
++printf 'OPENCLAW_WSL_PATH=%s\n' "$resolved"
++
++# Reject Windows-mounted launchers without using the previous `case` syntax
++# that proved fragile through the Windows -> wsl.exe -> bash -lc transport.
++printf '%s\n' "$resolved" | grep -q '^/mnt/' && exit 126
++printf '%s\n' "$resolved" | grep -Eiq '\.(cmd|exe)$' && exit 126
++
++"$resolved" --version
+ '@
+ 
+     $r = Invoke-Wsl $cmd -AllowFailure
+@@ -646,8 +650,8 @@
+         return $true
+     }
+ 
+-    if ($r.Output -match 'WINDOWS_SHIM_REJECTED:') {
+-        Warn "A Windows OpenClaw shim was visible inside WSL and was rejected."
++    if ($r.ExitCode -eq 126) {
++        Warn "A Windows-mounted OpenClaw launcher was visible inside WSL and was rejected."
+     } else {
+         Warn "Native Linux OpenClaw is not installed in WSL."
+     }
+@@ -2035,13 +2039,20 @@
+ command -v curl >/dev/null 2>&1 || die "curl is required"
+ test -f "$ARCHIVE" || die "Archive not found: $ARCHIVE"
+ 
+-resolved_openclaw="$(command -v openclaw 2>/dev/null || true)"
+-case "$resolved_openclaw" in
+-  /mnt/*|*.cmd|*.exe)
+-    warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
+-    resolved_openclaw=""
+-    ;;
+-esac
++if [[ -x "$HOME/.openclaw/bin/openclaw" ]]; then
++  resolved_openclaw="$HOME/.openclaw/bin/openclaw"
++else
++  resolved_openclaw="$(command -v openclaw 2>/dev/null || true)"
++fi
++
++if [[ -n "$resolved_openclaw" ]] && printf '%s\n' "$resolved_openclaw" | grep -q '^/mnt/'; then
++  warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
++  resolved_openclaw=""
++fi
++if [[ -n "$resolved_openclaw" ]] && printf '%s\n' "$resolved_openclaw" | grep -Eiq '\.(cmd|exe)$'; then
++  warn "Rejecting Windows OpenClaw shim inside WSL: $resolved_openclaw"
++  resolved_openclaw=""
++fi
+ 
+ if [[ -z "$resolved_openclaw" ]]; then
+   say "Installing latest stable OpenClaw"
+@@ -2555,21 +2566,31 @@
+ 
+     $wslVerifyCmd = @'
+ set -e
+-oc="$(command -v openclaw 2>/dev/null || true)"
+-nodebin="$(command -v node 2>/dev/null || true)"
++if [ -x "$HOME/.openclaw/bin/openclaw" ]; then
++  oc="$HOME/.openclaw/bin/openclaw"
++else
++  oc="$(command -v openclaw 2>/dev/null || true)"
++fi
++
++if [ -x "$HOME/.openclaw/tools/node/bin/node" ]; then
++  nodebin="$HOME/.openclaw/tools/node/bin/node"
++else
++  nodebin="$(command -v node 2>/dev/null || true)"
++fi
+ 
+ printf 'OPENCLAW_PATH=%s\n' "$oc"
+ printf 'NODE_PATH=%s\n' "$nodebin"
+ 
+-case "$oc" in
+-  ""|/mnt/*|*.cmd|*.exe) exit 91 ;;
+-esac
+-case "$nodebin" in
+-  ""|/mnt/*|*.cmd|*.exe) exit 92 ;;
+-esac
+-
+-openclaw --version
+-node --version
++[ -n "$oc" ] || exit 91
++[ -n "$nodebin" ] || exit 92
++
++printf '%s\n' "$oc" | grep -q '^/mnt/' && exit 91
++printf '%s\n' "$nodebin" | grep -q '^/mnt/' && exit 92
++printf '%s\n' "$oc" | grep -Eiq '\.(cmd|exe)$' && exit 91
++printf '%s\n' "$nodebin" | grep -Eiq '\.(cmd|exe)$' && exit 92
++
++"$oc" --version
++"$nodebin" --version
+ python3 --version
+ printf 'PID1='
+ ps -p 1 -o comm=
