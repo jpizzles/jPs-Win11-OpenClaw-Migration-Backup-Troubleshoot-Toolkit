@@ -1,0 +1,22 @@
+# Generated real backup data - NEVER COMMIT
+OpenClaw_*Backup_*/
+OpenClaw_*MigrationKit_*/
+Payload/
+Windows/
+*.tar.gz
+windows-openclaw-state.zip
+package-manifest.json
+tool-run.log
+BACKUP_FAILED.txt
+NO_BACKUP_EXPORTED.txt
+
+# Local logs
+OpenClaw-Restore-Logs/
+OpenClaw-Repair-Logs/
+OpenClaw-Verification-Logs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

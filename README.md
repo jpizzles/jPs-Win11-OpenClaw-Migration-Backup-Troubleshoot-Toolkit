@@ -1,8 +1,8 @@
 # Hatch IQ OpenClaw Backup, Migration & Recovery Toolkit
 
 <p align="center">
-  <b>Back up it. Move it. Restore it. Repair it.</b><br>
-  A Windows 11 + WSL2 recovery toolkit for OpenClaw.
+  <b>Back it up. Move it. Restore it. Repair it.</b><br>
+  Windows 11 + WSL2 backup, migration, restore, reset and troubleshooting for OpenClaw.
 </p>
 
 <p align="center">
@@ -11,44 +11,33 @@
   <img alt="WSL2" src="https://img.shields.io/badge/WSL-2-FCC624?logo=linux&logoColor=black">
   <img alt="OpenClaw" src="https://img.shields.io/badge/OpenClaw-Backup%20%7C%20Migration%20%7C%20Repair-111827">
   <img alt="Hatch IQ" src="https://img.shields.io/badge/Created%20by-Hatch%20IQ-7C3AED">
+  <img alt="Release" src="https://img.shields.io/badge/release-v1.10.4-22C55E">
 </p>
 
-> **Created by Hatch IQ** as an independent community utility for OpenClaw backup, migration, restore, recovery, reset and debugging workflows.
+> Created by **Hatch IQ** as an independent community utility for OpenClaw backup, migration, restore, recovery, reset and debugging workflows.
+
+## Current release — v1.10.4
+
+Download the complete toolkit:
+
+[`dist/OpenClaw_Backup_Migration_Toolkit_v1.10.4.zip`](dist/OpenClaw_Backup_Migration_Toolkit_v1.10.4.zip)
+
+The ZIP contains the actual `OpenClaw-Backup-Migrate.ps1`, double-click launcher, restore helpers, changelog and README. Extract it before running.
 
 ## What it does
 
-The Hatch IQ OpenClaw Toolkit is a double-clickable Windows PowerShell utility designed around a common OpenClaw topology:
+The toolkit is designed around a common OpenClaw topology:
 
-- **WSL2** hosts the real OpenClaw Gateway.
-- **Windows 11** hosts the companion/CUA node.
-- Backups are verified before they are accepted.
-- Migration packages include their own restore/bootstrap scripts.
-- Repair mode can stop duplicate processes, rebuild services/nodes and validate a clean restart.
+- WSL2 hosts the real OpenClaw Gateway.
+- Windows 11 hosts the companion/CUA node.
+- Backups are independently verified before acceptance.
+- Migration packages carry their own restore/bootstrap tooling.
+- New-PC restore can provision prerequisites automatically.
+- Repair mode cleans duplicate processes/nodes, rebuilds services and validates the stack.
 
-The toolkit was built to fail closed: when a backup, transfer, checksum, restore prerequisite or recovery check cannot be verified, it reports the problem instead of pretending the operation succeeded.
+The design is fail-closed: if archive creation, transfer, checksum verification, prerequisite installation or restore verification cannot be confirmed, the toolkit stops and reports the problem instead of pretending the operation succeeded.
 
-## Highlights
-
-| Capability | What it does |
-|---|---|
-| Full verified backup | Stops the Gateway safely, creates an OpenClaw archive, verifies it, exports it to Windows and builds a portable ZIP |
-| New-PC migration kit | Creates a portable package with restore scripts and prerequisite bootstrap |
-| Full restore | Verifies package checksums, stages the restore, activates recovered state, rebuilds services and validates health |
-| New-PC bootstrap | Checks WSL, Linux distro, systemd, Linux utilities, Windows OpenClaw and WSL OpenClaw before restoring |
-| Fail-safe installer fallback | Generates manual instructions + `CONTINUE-RESTORE.cmd` if an automatic prerequisite install cannot finish |
-| Reset / repair / debug | Stops all known OpenClaw instances, removes duplicate runtime nodes, repairs Gateway/CUA services and reruns health checks |
-| Package verification | SHA-256 validation plus OpenClaw's own backup verification |
-| Portable Windows ZIP | Produces a single validated backup/migration ZIP for storage or transfer |
-
-## Quick start
-
-Download the latest packaged toolkit from `dist/`, extract it, and double-click:
-
-```text
-OpenClaw-Backup-Migrate.cmd
-```
-
-The menu provides:
+## Main menu
 
 ```text
 [1] Full verified backup
@@ -60,64 +49,39 @@ The menu provides:
 [7] Finalize an existing package into a Desktop ZIP
 ```
 
-## New PC migration
+## New-PC migration
 
-### Restoring older verified backup packages
+On the source machine, choose option 2 and move the resulting ZIP to the destination Windows 11 machine.
 
-You do not need to alter or regenerate an older verified package just to use a newer restore engine. Run `RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd` from the latest toolkit, select the existing package, and the toolkit verifies the package's original manifest before restore.
-
-On the source PC, choose:
-
-```text
-2 - Create portable migration kit
-```
-
-Move the resulting ZIP to the destination Windows 11 PC, extract it, then use:
+After extraction, use:
 
 ```text
 RESTORE-ON-NEW-PC.cmd
 ```
 
-The package also includes:
+For an older already-verified backup package, the latest toolkit also contains:
 
 ```text
-CHECK-NEW-PC-PREREQUISITES.cmd
-TEST-RESTORE-LAUNCHER.cmd
-RESTORE-THIS-BACKUP.cmd
-RESTORE-THIS-BACKUP.ps1
-RESTORE-ON-NEW-PC.ps1
-README-RESTORE.txt
+RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd
+CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd
 ```
 
-### Deterministic WSL provisioning
+You do not need to rewrite or invalidate the old backup package just to use a newer restore engine.
 
-If WSL is present but no Linux distro exists, v1.10.0 downloads Canonical's official Ubuntu 24.04 WSL rootfs, verifies Canonical's published SHA-256, and imports it directly as `OpenClawGateway` with `wsl --import`. This avoids Microsoft Store/first-launch registration timing problems on new PCs.
+## New-PC prerequisite bootstrap
 
-### Windows installer reliability
-
-v1.10.2 downloads the official Windows OpenClaw installer to a temporary `.ps1` file and runs it with `powershell.exe -File -NoOnboard`, instead of constructing an in-memory scriptblock from `Invoke-WebRequest.Content`. This avoids byte-array coercion failures seen on some Windows PowerShell 5.1 builds.
-
-### WSL / Windows runtime isolation
-
-v1.10.3 isolates toolkit WSL commands from the inherited Windows PATH. This prevents native Windows npm/OpenClaw shims under `/mnt/c/...` from being selected instead of the WSL Gateway's rootless OpenClaw and Node runtimes.
-
-### New-PC prerequisite bootstrap
-
-Before touching restored OpenClaw state, the toolkit checks for:
+Before restored state is activated, the toolkit checks and, where possible, installs:
 
 - WSL / WSL2
-- a usable Linux distribution
+- Ubuntu 24.04 when no usable distro exists
 - systemd
-- `curl`
-- Python 3
-- `tar`, `gzip`, `sha256sum` and related restore utilities
-- OpenClaw inside WSL
+- Linux restore utilities
+- native Linux/WSL OpenClaw
+- the private Linux Node runtime
 - native Windows OpenClaw
-- required Node runtime paths installed by the OpenClaw installers
+- the Windows Node runtime required by the OpenClaw installer
 
-Where possible, missing prerequisites are installed automatically.
-
-If automated installation cannot safely complete — for example because Windows requires a reboot or a distro requires first-run setup — the toolkit stops before a partial restore and creates:
+If automated installation cannot safely complete, the toolkit stops before partial state activation and writes:
 
 ```text
 Documents\OpenClaw-Restore-Logs\<run>\
@@ -125,106 +89,78 @@ Documents\OpenClaw-Restore-Logs\<run>\
     CONTINUE-RESTORE.cmd
 ```
 
-Complete the listed prerequisite and run `CONTINUE-RESTORE.cmd`. The prerequisites are checked again before restore continues.
+Complete the listed prerequisite and run `CONTINUE-RESTORE.cmd`; the prerequisite checks are repeated before restore continues.
+
+## v1.10.4 — WSL post-install freeze fix
+
+The reported failure had already completed the WSL OpenClaw install successfully, then appeared to freeze during a non-essential shell-profile/symlink mutation.
+
+v1.10.4 removes that step entirely. After installation it directly verifies:
+
+```text
+~/.openclaw/bin/openclaw
+~/.openclaw/tools/node/bin/node
+```
+
+Both canonical binaries are executed with `--version` before restore is allowed to proceed. The installer also gets a 15-minute watchdog when Linux `timeout` is available, so a genuine installer hang fails safely instead of waiting forever.
+
+## Recent reliability fixes
+
+- v1.10.3 isolates all toolkit WSL commands from inherited Windows PATH entries so `/mnt/c/.../npm/openclaw` cannot replace the native Linux CLI.
+- v1.10.2 downloads the Windows OpenClaw installer to a real `.ps1` file and executes it with `powershell.exe -File`, avoiding PowerShell 5.1 byte-array coercion failures.
+- v1.10.1 fixes PowerShell parsing of Linux `/dev/null` redirection.
+- v1.10.0 replaces flaky Store/first-launch provisioning on empty new PCs with deterministic Ubuntu 24.04 `wsl --import` provisioning and Canonical SHA-256 verification.
 
 ## Backup integrity
 
-The backup path intentionally uses multiple independent checks:
+The backup flow uses layered validation:
 
 1. OpenClaw creates the archive.
 2. OpenClaw reports `verified=true`.
-3. `openclaw backup verify` is run independently.
-4. WSL reports the source byte count.
-5. The archive is streamed as raw binary output through `wsl.exe` into a Windows `FileStream`.
-6. WSL and Windows byte counts must match.
+3. `openclaw backup verify` runs independently.
+4. Source byte count is checked in WSL.
+5. The archive is moved to Windows through the toolkit's raw binary transfer path.
+6. Windows and WSL byte counts must match.
 7. WSL SHA-256 must match Windows `Get-FileHash`.
 8. Package manifest hashes are validated.
-9. The final portable ZIP is reopened and inspected.
+9. The portable ZIP is reopened and inspected.
 10. The expected OpenClaw archive and manifest must exist inside the ZIP.
 
-## Reset / repair / debug mode
+## Reset / repair / debug
 
-Option 6 is designed for a WSL-Gateway + Windows-CUA installation.
+Option 6 can:
 
-It can:
-
-- stop the OpenClaw Windows companion
+- stop the Windows companion
 - stop the Windows CUA scheduled node
-- terminate duplicate/orphaned `node run` process trees
+- terminate duplicate/orphan `node run` process trees
 - remove an accidental competing native-Windows Gateway
 - stop and rebuild the WSL Gateway service
-- create a best-effort pre-repair safety backup
-- run OpenClaw Doctor repair
-- run update/plugin repair
-- rebuild the Windows CUA node
-- verify the exec-node binding
-- check CUA capabilities such as `computer.act`, `screen.snapshot`, and `system.run`
-- check pending device/node approvals
+- attempt a pre-repair safety backup
+- run Doctor/update repair
+- rebuild Windows CUA
+- repair exec-node binding
+- verify CUA capabilities
+- check pending approvals
 - require a healthy final Gateway deep probe
-- require a single Windows node-host root process tree at the end
+- require exactly one Windows node-host root process tree
 
-The repair tool intentionally does **not** silently approve new OpenClaw security/device requests.
-
-## Full-backup restore
-
-A normal option-1 Full Backup is also independently restorable.
-
-After extracting the backup ZIP:
-
-```text
-RESTORE-THIS-BACKUP.cmd
-```
-
-The restore is staged and verified before live state is activated.
+It intentionally does not silently approve new OpenClaw security/device requests.
 
 ## Security
 
-OpenClaw backup packages may contain credentials, tokens, session history, agent state, configuration, and other sensitive material.
+Generated backup/migration packages may contain credentials, tokens, session history, agent state and configuration. Treat them like a password vault.
 
-Treat generated backup and migration ZIPs like a password vault:
-
-- keep them encrypted at rest
-- do not upload personal backup ZIPs to a public repository
-- do not attach real backup packages to public GitHub issues
-- scrub tokens and personal paths from logs before posting them
+Do not upload real personal backup packages or unsanitized logs to public GitHub issues.
 
 See [`SECURITY.md`](SECURITY.md).
 
-## Project layout
+## Documentation
 
-```text
-.
-├── OpenClaw-Backup-Migrate.ps1
-├── OpenClaw-Backup-Migrate.cmd
-├── README.md
-├── CHANGELOG.md
-├── SECURITY.md
-├── CONTRIBUTING.md
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── NEW-PC-MIGRATION.md
-│   └── RESET-REPAIR.md
-└── dist/
-    └── OpenClaw_Backup_Migration_Toolkit_v1.10.3.zip
-```
-
-## Requirements
-
-Primary target:
-
-- Windows 11
-- Windows PowerShell 5.1+
-- WSL2
-- OpenClaw
-- systemd-enabled Linux environment for the Gateway
-
-The new-PC migration flow attempts to provision the missing prerequisites it can safely install.
-
-## Status
-
-Current packaged release: **v1.10.3**
-
-This utility has been developed against a real Windows 11 + WSL OpenClaw deployment. OpenClaw CLI behavior can change between releases, so users should preserve a known-good backup and review repair output after OpenClaw upgrades.
+- [`CHANGELOG.md`](CHANGELOG.md)
+- [`RELEASE_NOTES_v1.10.4.md`](RELEASE_NOTES_v1.10.4.md)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- [`docs/NEW-PC-MIGRATION.md`](docs/NEW-PC-MIGRATION.md)
+- [`docs/RESET-REPAIR.md`](docs/RESET-REPAIR.md)
 
 ## Credits
 
