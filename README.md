@@ -10,18 +10,18 @@
   <img alt="PowerShell 5.1+" src="https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell&logoColor=white">
   <img alt="WSL2" src="https://img.shields.io/badge/WSL-2-FCC624?logo=linux&logoColor=black">
   <img alt="Hatch IQ" src="https://img.shields.io/badge/Created%20by-Hatch%20IQ-7C3AED">
-  <img alt="Release" src="https://img.shields.io/badge/release-v1.12.2-22C55E">
+  <img alt="Release" src="https://img.shields.io/badge/release-v1.12.3-22C55E">
 </p>
 
 > Created by **Hatch IQ** as an independent community utility for OpenClaw backup, migration, restore, recovery, reset and debugging workflows.
 
-## Current release — v1.12.2
+## Current release — v1.12.3
 
 Download the complete toolkit:
 
-[`dist/OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip`](dist/OpenClaw_Backup_Migration_Toolkit_v1.12.2.zip)
+[`dist/OpenClaw_Backup_Migration_Toolkit_v1.12.3.zip`](dist/OpenClaw_Backup_Migration_Toolkit_v1.12.3.zip)
 
-SHA-256: `be8c1999a1cd1777eca55b8cdbc2f7362f6246851eabdc479fa66eca7cb3f955`
+SHA-256: `c8701bfbfa683b0beb13d1f72592d774b3a35ae6efbb886bd518f6dc378dfa9d`
 
 Extract the ZIP before running.
 
@@ -65,23 +65,56 @@ RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd
 CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd
 ```
 
-## v1.12.2 — automatic Windows Hub setup code
+## v1.12.3 — local or existing-remote Gateway connection
 
-After a successful NEW-PC migration, the toolkit now automatically mints a fresh short-lived OpenClaw Windows Hub setup code from the restored WSL Gateway and prints it prominently for copy/paste into:
+After a successful NEW-PC migration, the toolkit now explains both Windows Hub connection topologies.
+
+### A. Restored local WSL Gateway
+
+The migration automatically mints a fresh short-lived Windows Hub setup code for the restored local Gateway and prints it for:
 
 ```text
 OpenClaw Companion -> Connection -> Setup code
 ```
 
-The setup payload is validated before display. The PowerShell transcript is stopped before the credential is minted, so the short-lived bootstrap credential is not persisted into `tool-run.log` or the backup package.
+Local Gateway URL:
 
-If the code expires, regenerate it inside the restored WSL distro:
-
-```bash
-~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789
+```text
+ws://127.0.0.1:18789
 ```
 
-Do not click **Install a local gateway** in Windows Hub after a successful migration; connect the Hub to the restored WSL Gateway instead.
+### B. Existing remote Gateway over Tailscale Serve
+
+If the new PC should attach to an already-running Gateway on another machine, the toolkit now includes the Direct connection flow:
+
+```text
+OpenClaw Companion -> Connection -> Direct
+wss://<gateway-host>.<tailnet>.ts.net
+```
+
+On the existing Gateway host, first verify:
+
+```text
+tailscale serve status
+```
+
+If Serve is already proxying the tailnet HTTPS endpoint to `http://127.0.0.1:18789`, do not reconfigure Serve.
+
+Retrieve the shared token only in an interactive terminal on the existing Gateway host:
+
+```bash
+~/.openclaw/bin/openclaw gateway auth-token --show
+```
+
+If a shared token was exposed, rotate it on that Gateway host:
+
+```bash
+~/.openclaw/bin/openclaw doctor --generate-gateway-token
+~/.openclaw/bin/openclaw gateway restart
+~/.openclaw/bin/openclaw gateway auth-token --show
+```
+
+Device approval and the separate Windows CUA/node approval must be completed on the Gateway the new PC is actually connecting to.
 
 ## Reliability hardening through v1.12.x
 
@@ -99,6 +132,7 @@ Recent releases include:
 - Windows paired-node SQLite identity recovery.
 - short-lived node bootstrap enrollment fallback.
 - explicit Windows Hub connection guide and automatic final Setup code.
+- existing-remote Gateway/Tailscale Direct connection guidance.
 
 ## Backup integrity
 
@@ -121,15 +155,9 @@ Restore is staged before activation. All staged source assets are resolved and v
 
 ## Windows Hub / Companion
 
-After migration, use the restored WSL Gateway rather than installing another Gateway.
+After migration, use the restored local Gateway or deliberately select an existing remote Gateway. Do not accidentally install a second Gateway from Windows Hub.
 
-Recommended connection method:
-
-```bash
-~/.openclaw/bin/openclaw qr --setup-code-only --url ws://127.0.0.1:18789
-```
-
-The current migration flow prints a fresh code automatically at the end.
+The restore log writes `CONNECT-WINDOWS-HUB.txt` with both connection flows.
 
 ## Security
 
@@ -140,7 +168,7 @@ Do not upload real personal backup packages or unsanitized logs to public GitHub
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md)
-- [`RELEASE_NOTES_v1.12.2.md`](RELEASE_NOTES_v1.12.2.md)
+- [`RELEASE_NOTES_v1.12.3.md`](RELEASE_NOTES_v1.12.3.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/NEW-PC-MIGRATION.md`](docs/NEW-PC-MIGRATION.md)
 - [`docs/RESET-REPAIR.md`](docs/RESET-REPAIR.md)
