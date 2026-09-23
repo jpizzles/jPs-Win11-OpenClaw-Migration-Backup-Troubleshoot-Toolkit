@@ -11,31 +11,33 @@
   <img alt="WSL2" src="https://img.shields.io/badge/WSL-2-FCC624?logo=linux&logoColor=black">
   <img alt="OpenClaw" src="https://img.shields.io/badge/OpenClaw-Backup%20%7C%20Migration%20%7C%20Repair-111827">
   <img alt="Hatch IQ" src="https://img.shields.io/badge/Created%20by-Hatch%20IQ-7C3AED">
-  <img alt="Release" src="https://img.shields.io/badge/release-v1.10.5-22C55E">
+  <img alt="Release" src="https://img.shields.io/badge/release-v1.10.6-22C55E">
 </p>
 
 > Created by **Hatch IQ** as an independent community utility for OpenClaw backup, migration, restore, recovery, reset and debugging workflows.
 
-## Current release — v1.10.5
+## Current release — v1.10.6
 
 Download the complete toolkit:
 
-[`dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip`](dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip)
+[`dist/OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip`](dist/OpenClaw_Backup_Migration_Toolkit_v1.10.6.zip)
 
-The ZIP contains the actual `OpenClaw-Backup-Migrate.ps1`, double-click launcher, restore helpers, changelog and README. Extract it before running.
+SHA-256: `55474b2f1f63573dfd19aff156ab4c80ba061c43a8413aa747311484a969af43`
+
+Extract the ZIP before running. The distribution contains the actual PowerShell engine, double-click launcher, restore/new-PC helpers, changelog and toolkit README.
 
 ## What it does
 
-The toolkit is designed around a common OpenClaw topology:
+The toolkit is designed around a Windows 11 + WSL2 OpenClaw topology:
 
-- WSL2 hosts the real OpenClaw Gateway.
-- Windows 11 hosts the companion/CUA node.
+- WSL2 hosts the OpenClaw Gateway.
+- Windows hosts the companion/CUA node.
 - Backups are independently verified before acceptance.
 - Migration packages carry their own restore/bootstrap tooling.
 - New-PC restore can provision prerequisites automatically.
 - Repair mode cleans duplicate processes/nodes, rebuilds services and validates the stack.
 
-The design is fail-closed: if archive creation, transfer, checksum verification, prerequisite installation or restore verification cannot be confirmed, the toolkit stops and reports the problem instead of pretending the operation succeeded.
+The design is fail-closed: if archive creation, transfer, checksum verification, prerequisite installation or restore verification cannot be confirmed, the toolkit stops and reports the problem rather than pretending the operation succeeded.
 
 ## Main menu
 
@@ -51,37 +53,59 @@ The design is fail-closed: if archive creation, transfer, checksum verification,
 
 ## New-PC migration
 
-On the source machine, choose option 2 and move the resulting ZIP to the destination Windows 11 machine.
-
-After extraction, use:
+On the source machine, choose option 2 and move the resulting ZIP to the destination Windows 11 machine. After extraction, run:
 
 ```text
 RESTORE-ON-NEW-PC.cmd
 ```
 
-For an older already-verified backup package, the latest toolkit also contains:
+For an older already-verified backup package, use the current restore engine without modifying the old package:
 
 ```text
 RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd
 CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd
 ```
 
-You do not need to rewrite or invalidate the old backup package just to use a newer restore engine.
+The original package manifest/checksums are revalidated before state activation.
+
+## v1.10.6 — robust Windows-to-WSL script transport
+
+The largest change in v1.10.6 is architectural: multiline Bash programs are no longer embedded inside a Windows native command argument such as `bash -lc <script>`.
+
+Windows PowerShell 5.1 and `wsl.exe` can reinterpret quoting, variables and command substitution at that boundary. Previous releases could therefore install OpenClaw successfully and then lose Bash variables in a later verification command.
+
+v1.10.6 now:
+
+1. writes each toolkit Bash program to a temporary UTF-8/no-BOM, LF-only `.sh` file;
+2. invokes it with `bash --noprofile --norc <script-file>`;
+3. uses the same mechanism for root-level WSL setup;
+4. runs a variable/quoting/command-substitution transport self-test before OpenClaw setup;
+5. verifies the canonical WSL binaries directly:
+
+```text
+~/.openclaw/bin/openclaw
+~/.openclaw/tools/node/bin/node
+```
+
+6. uses the same canonical runtime during staged restore and post-restore runtime repair;
+7. preserves literal Linux `$HOME` in generated fallback instructions instead of expanding it to the Windows home directory.
 
 ## New-PC prerequisite bootstrap
 
 Before restored state is activated, the toolkit checks and, where possible, installs:
 
 - WSL / WSL2
-- Ubuntu 24.04 when no usable distro exists
+- a usable Ubuntu environment
 - systemd
 - Linux restore utilities
 - native Linux/WSL OpenClaw
 - the private Linux Node runtime
 - native Windows OpenClaw
-- the Windows Node runtime required by the OpenClaw installer
+- the Windows runtime required by the OpenClaw installer
 
-If automated installation cannot safely complete, the toolkit stops before partial state activation and writes:
+If WSL is installed but no usable Linux distro exists, the toolkit can deterministically provision Ubuntu 24.04 using a Canonical WSL rootfs and SHA-256 verification.
+
+If automatic installation cannot safely complete, the toolkit stops before partial state activation and writes:
 
 ```text
 Documents\OpenClaw-Restore-Logs\<run>\
@@ -89,38 +113,27 @@ Documents\OpenClaw-Restore-Logs\<run>\
     CONTINUE-RESTORE.cmd
 ```
 
-Complete the listed prerequisite and run `CONTINUE-RESTORE.cmd`; the prerequisite checks are repeated before restore continues.
-
-## v1.10.5 — WSL canonical runtime detection
-
-v1.10.5 fixes the native WSL OpenClaw detector that could throw a Bash syntax error around `/mnt/*` before the installer ran. The toolkit now prefers the canonical Linux runtime files directly:
-
-```text
-~/.openclaw/bin/openclaw
-~/.openclaw/tools/node/bin/node
-```
-
-It rejects Windows-mounted `.cmd`/`.exe` launchers with simple path checks rather than the previous fragile Bash `case` expression.
-
-The v1.10.4 post-install reliability fix is retained: there is no non-essential `~/.profile` mutation or `~/.local/bin/openclaw` symlink step after installation. Both canonical binaries are verified directly, and the WSL OpenClaw installer has a 15-minute watchdog when Linux `timeout` is available.
+Complete the listed prerequisite and run `CONTINUE-RESTORE.cmd`; prerequisite checks are repeated before restore continues.
 
 ## Recent reliability fixes
 
-- v1.10.4 removes the post-install profile/symlink step that could appear to freeze after OpenClaw had already installed successfully.
-- v1.10.3 isolates all toolkit WSL commands from inherited Windows PATH entries so `/mnt/c/.../npm/openclaw` cannot replace the native Linux CLI.
-- v1.10.2 downloads the Windows OpenClaw installer to a real `.ps1` file and executes it with `powershell.exe -File`, avoiding PowerShell 5.1 byte-array coercion failures.
-- v1.10.1 fixes PowerShell parsing of Linux `/dev/null` redirection.
-- v1.10.0 replaces flaky Store/first-launch provisioning on empty new PCs with deterministic Ubuntu 24.04 `wsl --import` provisioning and Canonical SHA-256 verification.
+- **v1.10.6** replaces fragile inline `bash -lc` transport with script-file transport and fixes Linux `$HOME` fallback instructions.
+- **v1.10.5** prefers canonical Linux OpenClaw/Node binaries and removes a fragile Bash detector.
+- **v1.10.4** removes a post-install profile/symlink step that could appear to freeze after OpenClaw was already installed and adds an installer watchdog.
+- **v1.10.3** isolates WSL commands from inherited Windows npm/OpenClaw PATH entries.
+- **v1.10.2** downloads the Windows OpenClaw installer to a real `.ps1` file and runs it with child PowerShell `-File`, avoiding byte-array coercion failures.
+- **v1.10.1** fixes Windows PowerShell parsing of Linux `/dev/null` redirection.
+- **v1.10.0** adds deterministic Ubuntu 24.04 provisioning for empty new PCs.
 
 ## Backup integrity
 
-The backup flow uses layered validation:
+The backup path uses layered validation:
 
 1. OpenClaw creates the archive.
 2. OpenClaw reports `verified=true`.
 3. `openclaw backup verify` runs independently.
 4. Source byte count is checked in WSL.
-5. The archive is moved to Windows through the toolkit's raw binary transfer path.
+5. The archive is streamed from `wsl.exe` as raw bytes into a Windows `FileStream`.
 6. Windows and WSL byte counts must match.
 7. WSL SHA-256 must match Windows `Get-FileHash`.
 8. Package manifest hashes are validated.
@@ -147,21 +160,39 @@ Option 6 can:
 
 It intentionally does not silently approve new OpenClaw security/device requests.
 
+## Full-backup restore
+
+A normal option-1 Full Backup is independently restorable. After extracting it, run:
+
+```text
+RESTORE-THIS-BACKUP.cmd
+```
+
+Restore is staged and verified before live state is activated.
+
 ## Security
 
 Generated backup/migration packages may contain credentials, tokens, session history, agent state and configuration. Treat them like a password vault.
 
-Do not upload real personal backup packages or unsanitized logs to public GitHub issues.
-
-See [`SECURITY.md`](SECURITY.md).
+Do not upload real personal backup packages or unsanitized logs to public GitHub issues. See [`SECURITY.md`](SECURITY.md).
 
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md)
-- [`RELEASE_NOTES_v1.10.5.md`](RELEASE_NOTES_v1.10.5.md)
+- [`RELEASE_NOTES_v1.10.6.md`](RELEASE_NOTES_v1.10.6.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/NEW-PC-MIGRATION.md`](docs/NEW-PC-MIGRATION.md)
 - [`docs/RESET-REPAIR.md`](docs/RESET-REPAIR.md)
+
+## Requirements
+
+Primary target:
+
+- Windows 11
+- Windows PowerShell 5.1+
+- WSL2
+- OpenClaw
+- systemd-enabled Linux environment for the Gateway
 
 ## Credits
 
