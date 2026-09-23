@@ -1,0 +1,139 @@
+name: Publish v1.10.5 Final
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/publish-v1.10.5-final.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct good v1.10.4 source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=/tmp/v1.10.4.zip
+          PKG=/tmp/build/OpenClaw_Backup_Migration_Toolkit
+          rm -rf /tmp/build "$BASE"
+          mkdir -p "$PKG"
+          cat .release/v1.10.4/tool.zip.b64.* | tr -d '\r\n' | base64 --decode > "$BASE"
+          echo "Base archive bytes: $(stat -c%s "$BASE")"
+          for f in \
+            OpenClaw-Backup-Migrate.ps1 \
+            OpenClaw-Backup-Migrate.cmd \
+            RESTORE-EXISTING-PACKAGE-ON-NEW-PC.cmd \
+            CHECK-EXISTING-PACKAGE-NEW-PC-PREREQUISITES.cmd \
+            README.txt; do
+            unzip -p "$BASE" "OpenClaw_Backup_Migration_Toolkit/$f" > "$PKG/$f"
+            test -s "$PKG/$f"
+          done
+          grep -F '$Script:ToolVersion = "1.10.4"' "$PKG/OpenClaw-Backup-Migrate.ps1"
+          grep -F 'Verifying native WSL OpenClaw immediately after install' "$PKG/OpenClaw-Backup-Migrate.ps1"
+
+      - name: Apply v1.10.5 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG=/tmp/build/OpenClaw_Backup_Migration_Toolkit
+          (cd "$PKG" && patch -p1 < "$GITHUB_WORKSPACE/.release/v1.10.5/v1.10.4-to-v1.10.5.patch")
+          grep -F '$Script:ToolVersion = "1.10.5"' "$PKG/OpenClaw-Backup-Migrate.ps1"
+          grep -F 'timeout --signal=TERM --kill-after=20s 15m' "$PKG/OpenClaw-Backup-Migrate.ps1"
+          ! grep -F '/mnt/*|*.cmd|*.exe)' "$PKG/OpenClaw-Backup-Migrate.ps1"
+          ! grep -F "profile_line='export PATH=" "$PKG/OpenClaw-Backup-Migrate.ps1"
+
+      - name: Add v1.10.5 package documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG=/tmp/build/OpenClaw_Backup_Migration_Toolkit
+          cat > "$PKG/CHANGELOG.txt" <<'EOF'
+          v1.10.5
+          - Fixed native WSL OpenClaw detection syntax error around /mnt/*.
+          - Prefer canonical ~/.openclaw/bin/openclaw and private Node runtime directly.
+          - Reject Windows-mounted launchers with simple path checks.
+          - Retains v1.10.4 post-install freeze fix: no profile/symlink mutation.
+          - Retains 15-minute WSL OpenClaw installer watchdog.
+          - Retains all backup, migration, restore, verification and reset/repair functionality.
+          EOF
+          cat >> "$PKG/README.txt" <<'EOF'
+
+          v1.10.5 NOTE
+          ------------
+          WSL OpenClaw detection now prefers the canonical Linux OpenClaw and private Node binaries directly.
+          The fragile Bash case detector was removed. The post-install profile/symlink step remains removed.
+          EOF
+
+      - name: Build and verify release ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$GITHUB_WORKSPACE/dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip"
+          rm -f "$ZIP"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          (cd /tmp/build && zip -9 -r "$ZIP" OpenClaw_Backup_Migration_Toolkit >/dev/null)
+          unzip -t "$ZIP"
+          unzip -p "$ZIP" OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.ps1 | grep -F '$Script:ToolVersion = "1.10.5"'
+          HASH=$(sha256sum "$ZIP" | awk '{print $1}')
+          echo "$HASH  OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip" > SHA256SUMS.txt
+          printf 'Hatch IQ OpenClaw Backup, Migration & Recovery Toolkit\nLatest: v1.10.5\nSHA-256: %s\n' "$HASH" > LATEST.txt
+          cp /tmp/build/OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.ps1 .
+          cp /tmp/build/OpenClaw_Backup_Migration_Toolkit/OpenClaw-Backup-Migrate.cmd .
+          cp /tmp/build/OpenClaw_Backup_Migration_Toolkit/README.txt TOOLKIT-README.txt
+          echo "Release SHA-256: $HASH"
+
+      - name: Update public documentation
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          p=Path('README.md')
+          s=p.read_text(encoding='utf-8')
+          s=re.sub(r'Current packaged release: \*\*v[0-9.]+\*\*','Current packaged release: **v1.10.5**',s)
+          s=re.sub(r'OpenClaw_Backup_Migration_Toolkit_v[0-9.]+\.zip','OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip',s)
+          s=s.replace(' Add a license before accepting third-party redistribution or contributions.','')
+          if '### WSL canonical runtime detection' not in s:
+              insert='''\n### WSL canonical runtime detection\n\nv1.10.5 removes the fragile Bash `case` detector around `/mnt/*`, prefers the canonical Linux OpenClaw/private Node binaries, and retains the post-install freeze fix.\n\n'''
+              marker='### New-PC prerequisite bootstrap\n'
+              s=s.replace(marker,insert+marker,1) if marker in s else s
+          p.write_text(s,encoding='utf-8')
+          c=Path('CHANGELOG.md')
+          old=c.read_text(encoding='utf-8') if c.exists() else '# Changelog\n\n'
+          if 'v1.10.5' not in old:
+              body=re.sub(r'^# Changelog\s*','',old)
+              c.write_text('# Changelog\n\nv1.10.5\n- Fix WSL OpenClaw detector syntax error.\n- Prefer canonical Linux OpenClaw and private Node binaries.\n- Retain post-install freeze fix and watchdog.\n\n'+body,encoding='utf-8')
+
+      - name: Commit verified files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add OpenClaw-Backup-Migrate.ps1 OpenClaw-Backup-Migrate.cmd TOOLKIT-README.txt README.md CHANGELOG.md RELEASE_NOTES_v1.10.5.md LATEST.txt SHA256SUMS.txt dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish Hatch IQ OpenClaw Toolkit v1.10.5"
+            git push origin HEAD:main
+          fi
+
+      - name: Create GitHub Release v1.10.5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=dist/OpenClaw_Backup_Migration_Toolkit_v1.10.5.zip
+          if gh release view v1.10.5 >/dev/null 2>&1; then
+            gh release upload v1.10.5 "$ZIP" --clobber
+          else
+            gh release create v1.10.5 "$ZIP" --title "Hatch IQ OpenClaw Toolkit v1.10.5" --notes-file RELEASE_NOTES_v1.10.5.md --target main
+          fi
+          gh release view v1.10.5 --json tagName,name,url,assets
