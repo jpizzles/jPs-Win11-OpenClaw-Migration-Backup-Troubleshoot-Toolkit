@@ -86,3 +86,4 @@ jobs:
           gh release view v1.10.4 --json tagName,name,url,assets
 
 # Re-trigger after all verified payload chunks were staged.
+# Re-trigger requested 2026-09-22 after v1.10.4 post-install freeze fix validation.
